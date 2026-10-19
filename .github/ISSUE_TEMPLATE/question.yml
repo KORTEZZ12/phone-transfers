@@ -1,0 +1,29 @@
+name: Вопрос аналитику
+description: Разработка или QA нашли дыру в спецификации
+title: "Вопрос: "
+labels: ["вопрос аналитику"]
+body:
+  - type: input
+    id: where
+    attributes:
+      label: Где в спецификации
+      placeholder: TR-11, повтор с тем же ключом
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Что неясно
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Какие варианты видит разработка
+  - type: dropdown
+    id: blocking
+    attributes:
+      label: Блокирует работу?
+      options: ["Да", "Нет"]
+    validations:
+      required: true

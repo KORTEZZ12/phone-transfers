@@ -1,0 +1,22 @@
+name: Запрос на изменение
+description: Заказчик меняет требования по ходу проекта
+title: "Изменение: "
+labels: ["изменение"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: Что меняется
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Почему
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Анализ влияния
+      description: Затронутые истории, правила, процессы, контракты; что переделать и что перепроверить

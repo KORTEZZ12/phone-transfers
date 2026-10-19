@@ -1,0 +1,36 @@
+name: Дефект
+description: Поведение расходится с критериями приёмки
+title: "Дефект: "
+labels: ["дефект"]
+body:
+  - type: input
+    id: story
+    attributes:
+      label: История и сценарий
+      placeholder: Таблица отказов, строка 8
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидалось по критерию
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Фактически
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Тип
+      description: Размечает аналитик
+      options: ["Ошибка кода", "Ошибка требований", "Не определено"]
