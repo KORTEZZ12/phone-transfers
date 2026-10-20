@@ -1,0 +1,212 @@
+asyncapi: 3.1.0
+info:
+  title: События переводов
+  version: 1.0.0
+  description: |
+    Сервис переводов публикует каждое изменение статуса перевода (TR-27).
+    События попадают в Kafka через outbox: статус и событие пишутся в одной транзакции,
+    отдельный процесс переносит события в топик (ADR-003).
+
+    Гарантия доставки — «хотя бы один раз». Поэтому каждый потребитель обязан:
+    1. Пропускать событие, `eventId` которого уже обработан.
+    2. Применять событие, только если `transferVersion` больше сохранённой у потребителя.
+       Финальный статус событием с меньшей версией не откатывается (TR-29).
+    3. Не блокировать партицию: после трёх неудачных попыток событие уходит в свой топик
+       повторов, после исчерпания повторов — в DLQ с алертом.
+
+    В событиях нет номеров телефонов и счетов, только идентификаторы клиентов.
+  contact:
+    name: Кирилл Фадеев, системный аналитик
+servers:
+  production:
+    host: kafka.bank.example:9093
+    protocol: kafka-secure
+    description: Кластер Kafka банка, вымышленный адрес
+defaultContentType: application/json
+channels:
+  transferEvents:
+    address: transfers.events.v1
+    title: События переводов
+    description: |
+      Ключ сообщения — `transferId`: все события одного перевода попадают в одну партицию
+      и читаются в порядке публикации. Порядок между разными переводами не гарантируется.
+    messages:
+      transferStatusChanged:
+        $ref: '#/components/messages/TransferStatusChanged'
+    bindings:
+      kafka:
+        topic: transfers.events.v1
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          cleanup.policy: [delete]
+          retention.ms: 1209600000
+        bindingVersion: 0.5.0
+  notificationsRetry:
+    address: transfers.events.v1.notifications.retry
+    title: Повторы для уведомлений
+    description: Событие, которое сервис уведомлений не обработал за три попытки. Повтор через 1, 5 и 15 мин
+    messages:
+      transferStatusChanged:
+        $ref: '#/components/messages/TransferStatusChanged'
+  notificationsDlq:
+    address: transfers.events.v1.notifications.dlq
+    title: DLQ уведомлений
+    description: События, которые не удалось обработать после всех повторов. Каждое попадание — алерт
+    messages:
+      transferStatusChanged:
+        $ref: '#/components/messages/TransferStatusChanged'
+operations:
+  publishTransferEvent:
+    action: send
+    channel:
+      $ref: '#/channels/transferEvents'
+    title: Публикация изменения статуса
+    summary: Сервис переводов, через outbox
+    messages:
+      - $ref: '#/channels/transferEvents/messages/transferStatusChanged'
+  notifyParticipants:
+    action: receive
+    channel:
+      $ref: '#/channels/transferEvents'
+    title: Пуш отправителю и получателю
+    summary: |
+      Сервис уведомлений. Пуш только на финальные статусы и на ON_REVIEW.
+      Дедупликация по eventId, иначе клиент получит два пуша.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [notifications]
+        bindingVersion: 0.5.0
+    messages:
+      - $ref: '#/channels/transferEvents/messages/transferStatusChanged'
+  retryNotification:
+    action: send
+    channel:
+      $ref: '#/channels/notificationsRetry'
+    title: Отложить событие для повтора
+    summary: Сервис уведомлений, после трёх неудачных попыток
+    messages:
+      - $ref: '#/channels/notificationsRetry/messages/transferStatusChanged'
+  parkNotification:
+    action: send
+    channel:
+      $ref: '#/channels/notificationsDlq'
+    title: Отправить событие в DLQ
+    summary: Сервис уведомлений, после исчерпания повторов
+    messages:
+      - $ref: '#/channels/notificationsDlq/messages/transferStatusChanged'
+  buildHistory:
+    action: receive
+    channel:
+      $ref: '#/channels/transferEvents'
+    title: История операций
+    summary: Хранит последнее состояние перевода по transferVersion, финальный статус не откатывает
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [operations-history]
+        bindingVersion: 0.5.0
+    messages:
+      - $ref: '#/channels/transferEvents/messages/transferStatusChanged'
+components:
+  messages:
+    TransferStatusChanged:
+      name: TransferStatusChanged
+      title: Статус перевода изменился
+      contentType: application/json
+      headers:
+        type: object
+        required: [eventId, eventType, schemaVersion]
+        properties:
+          eventId:
+            type: string
+            format: uuid
+          eventType:
+            type: string
+            const: TransferStatusChanged
+          schemaVersion:
+            type: string
+            const: '1'
+          traceparent:
+            type: string
+            description: W3C Trace Context из запроса, который запустил изменение
+      payload:
+        $ref: '#/components/schemas/TransferStatusChangedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: transferId
+          bindingVersion: 0.5.0
+      examples:
+        - name: completed
+          summary: Перевод выполнен
+          headers:
+            eventId: 7e6d5c4b-3a2f-4e1d-8c9b-0a1f2e3d4c5b
+            eventType: TransferStatusChanged
+            schemaVersion: '1'
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+          payload:
+            eventId: 7e6d5c4b-3a2f-4e1d-8c9b-0a1f2e3d4c5b
+            occurredAt: '2026-10-19T12:01:04+03:00'
+            transferId: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+            transferVersion: 5
+            status: COMPLETED
+            previousStatus: PROCESSING
+            isFinal: true
+            rejectReason: null
+            amount:
+              value: '1500.00'
+              currency: RUB
+            senderClientId: 1f2e3d4c-5b6a-4978-8a7b-6c5d4e3f2a1b
+            recipientClientId: 2a3b4c5d-6e7f-4809-9a1b-2c3d4e5f6a7b
+  schemas:
+    TransferStatusChangedPayload:
+      type: object
+      required: [eventId, occurredAt, transferId, transferVersion, status, isFinal, amount, senderClientId, recipientClientId]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: Совпадает с заголовком eventId, ключ дедупликации
+        occurredAt:
+          type: string
+          format: date-time
+        transferId:
+          type: string
+          format: uuid
+        transferVersion:
+          type: integer
+          minimum: 1
+          description: Растёт на 1 с каждым изменением перевода, по ней потребитель отбрасывает устаревшие события
+        status:
+          type: string
+          enum: [PROCESSING, ON_REVIEW, COMPLETED, REJECTED, CANCELLED, FAILED]
+        previousStatus:
+          type: [string, 'null']
+          enum: [PROCESSING, ON_REVIEW, COMPLETED, REJECTED, CANCELLED, FAILED, null]
+        isFinal:
+          type: boolean
+        rejectReason:
+          type: [string, 'null']
+          enum: [INSUFFICIENT_FUNDS, FRAUD_SUSPECTED, REVIEW_EXPIRED, RECIPIENT_ACCOUNT_UNAVAILABLE, null]
+        amount:
+          type: object
+          required: [value, currency]
+          properties:
+            value:
+              type: string
+              pattern: '^\d{1,15}(\.\d{1,2})?$'
+            currency:
+              type: string
+              enum: [RUB, USD, EUR, CNY]
+        senderClientId:
+          type: string
+          format: uuid
+        recipientClientId:
+          type: string
+          format: uuid

@@ -1,0 +1,823 @@
+openapi: 3.1.0
+info:
+  title: Переводы по номеру телефона
+  version: 1.0.0
+  description: |
+    API мобильного приложения для переводов между клиентами банка по номеру телефона
+    и внутренний колбэк антифрода. Соглашения — в [README](README.md):
+    аутентификация, ключ идемпотентности, формат сумм, каталог ошибок.
+
+    Отправитель всегда определяется по токену доступа, а не по телу запроса.
+    Банк вымышленный, домен `bank.example` зарезервирован для примеров.
+  contact:
+    name: Кирилл Фадеев, системный аналитик
+  license:
+    name: CC BY 4.0
+    url: https://creativecommons.org/licenses/by/4.0/
+servers:
+  - url: https://api.bank.example
+    description: Внешний контур, через API-шлюз
+tags:
+  - name: Получатели
+    description: Поиск клиента банка по номеру телефона
+  - name: Переводы
+    description: Создание, статус и отмена перевода
+  - name: Лимиты
+    description: Сколько ещё можно перевести
+  - name: Внутренние
+    description: Вызовы от систем банка, не из приложения
+security:
+  - bearerAuth: []
+paths:
+  /v1/recipients/lookup:
+    post:
+      tags: [Получатели]
+      operationId: lookupRecipient
+      summary: Найти получателя по номеру телефона
+      description: |
+        POST, а не GET: номер телефона не должен попадать в URL и журналы доступа (TR-01).
+        Возвращает токен получателя: перевод создаётся по нему, а не по номеру (TR-02).
+        Частота ограничена: P-02 в минуту и P-03 в сутки на отправителя (TR-03).
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecipientLookupRequest'
+            example:
+              phone: '+79991234567'
+      responses:
+        '200':
+          description: Получатель найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientLookup'
+              example:
+                recipientToken: 6a1f0c9e-2b7d-4c55-9e1a-3f8d2c7b4a10
+                displayName: Иван П.
+                currencies: [RUB, USD]
+                expiresAt: '2026-10-19T12:10:00+03:00'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Клиента банка с таким номером нет
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://api.bank.example/problems/recipient-not-found
+                title: Получатель не найден
+                status: 404
+                code: RECIPIENT_NOT_FOUND
+                detail: Клиента банка с этим номером нет. Проверьте номер.
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '422':
+          description: Нельзя перевести самому себе
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://api.bank.example/problems/self-transfer
+                title: Это ваш номер
+                status: 422
+                code: SELF_TRANSFER
+                detail: Для перевода себе используйте перевод между своими счетами.
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '429':
+          $ref: '#/components/responses/LookupRateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/transfers:
+    post:
+      tags: [Переводы]
+      operationId: createTransfer
+      summary: Создать перевод
+      description: |
+        Синхронно: проверка лимита, его резерв и блокировка суммы на счёте (TR-08, TR-12, TR-13).
+        Дальше асинхронно: антифрод и проводка. Итог — в `GET /v1/transfers/{transferId}` и пуше.
+
+        Повтор с тем же `Idempotency-Key` и тем же телом в течение P-07 возвращает тот же перевод
+        с актуальным статусом и заголовком `Idempotent-Replayed: true`. Если исходный запрос
+        был отклонён, повтор возвращает тот же отказ (TR-11).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTransferRequest'
+            example:
+              recipientToken: 6a1f0c9e-2b7d-4c55-9e1a-3f8d2c7b4a10
+              sourceAccountId: 0b8e7d6c-5a4f-4e3d-9c2b-1a0f9e8d7c6b
+              amount:
+                value: '1500.00'
+                currency: RUB
+              comment: За билеты
+      responses:
+        '201':
+          description: Перевод принят, сумма заблокирована
+          headers:
+            Location:
+              description: Адрес перевода
+              schema:
+                type: string
+              example: /v1/transfers/3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+              example:
+                id: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+                status: PROCESSING
+                rejectReason: null
+                amount:
+                  value: '1500.00'
+                  currency: RUB
+                recipient:
+                  displayName: Иван П.
+                sourceAccountId: 0b8e7d6c-5a4f-4e3d-9c2b-1a0f9e8d7c6b
+                comment: За билеты
+                cancellable: false
+                createdAt: '2026-10-19T12:01:03+03:00'
+                updatedAt: '2026-10-19T12:01:03+03:00'
+                completedAt: null
+        '200':
+          description: Повтор запроса с тем же ключом. Перевод с актуальным статусом
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+              example:
+                id: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+                status: COMPLETED
+                rejectReason: null
+                amount:
+                  value: '1500.00'
+                  currency: RUB
+                recipient:
+                  displayName: Иван П.
+                sourceAccountId: 0b8e7d6c-5a4f-4e3d-9c2b-1a0f9e8d7c6b
+                comment: За билеты
+                cancellable: false
+                createdAt: '2026-10-19T12:01:03+03:00'
+                updatedAt: '2026-10-19T12:01:04+03:00'
+                completedAt: '2026-10-19T12:01:04+03:00'
+        '400':
+          description: Ошибка в запросе или нет ключа идемпотентности
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validation:
+                  $ref: '#/components/examples/ValidationError'
+                noKey:
+                  summary: Нет заголовка Idempotency-Key
+                  value:
+                    type: https://api.bank.example/problems/idempotency-key-required
+                    title: Нужен ключ идемпотентности
+                    status: 400
+                    code: IDEMPOTENCY_KEY_REQUIRED
+                    detail: Передайте заголовок Idempotency-Key.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Счёт списания не принадлежит отправителю
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://api.bank.example/problems/account-not-owned
+                title: Счёт недоступен
+                status: 403
+                code: ACCOUNT_NOT_OWNED
+                detail: С этого счёта нельзя переводить.
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '409':
+          description: Запрос с этим ключом ещё обрабатывается
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://api.bank.example/problems/idempotency-key-in-progress
+                title: Перевод ещё создаётся
+                status: 409
+                code: IDEMPOTENCY_KEY_IN_PROGRESS
+                detail: Повторите запрос с тем же ключом через секунду.
+                retryAfterSeconds: 1
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '422':
+          description: Перевод отклонён до блокировки средств
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                limit:
+                  summary: Превышен лимит
+                  value:
+                    type: https://api.bank.example/problems/limit-exceeded
+                    title: Превышен лимит
+                    status: 422
+                    code: LIMIT_EXCEEDED
+                    detail: Сегодня можно перевести ещё 20 000 ₽.
+                    limit:
+                      period: DAY
+                      available:
+                        value: '20000.00'
+                        currency: RUB
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                funds:
+                  summary: Не хватает денег
+                  value:
+                    type: https://api.bank.example/problems/insufficient-funds
+                    title: Недостаточно средств
+                    status: 422
+                    code: INSUFFICIENT_FUNDS
+                    detail: На счёте недостаточно денег для перевода.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                tokenExpired:
+                  summary: Токен получателя истёк
+                  value:
+                    type: https://api.bank.example/problems/recipient-token-expired
+                    title: Найдите получателя ещё раз
+                    status: 422
+                    code: RECIPIENT_TOKEN_EXPIRED
+                    detail: С момента поиска прошло больше 10 минут.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                keyReused:
+                  summary: Ключ уже использован для другого перевода
+                  value:
+                    type: https://api.bank.example/problems/idempotency-key-reused
+                    title: Повторите перевод заново
+                    status: 422
+                    code: IDEMPOTENCY_KEY_REUSED
+                    detail: Этот ключ уже использован для перевода с другими данными.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/transfers/{transferId}:
+    get:
+      tags: [Переводы]
+      operationId: getTransfer
+      summary: Статус перевода
+      description: |
+        Отправитель видит только свои переводы. Чужой перевод возвращает 404, а не 403,
+        чтобы не раскрывать, что такой перевод существует.
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+        - $ref: '#/components/parameters/Traceparent'
+      responses:
+        '200':
+          description: Перевод
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+              example:
+                id: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+                status: ON_REVIEW
+                rejectReason: null
+                amount:
+                  value: '150000.00'
+                  currency: RUB
+                recipient:
+                  displayName: Иван П.
+                sourceAccountId: 0b8e7d6c-5a4f-4e3d-9c2b-1a0f9e8d7c6b
+                comment: null
+                cancellable: true
+                createdAt: '2026-10-19T12:01:03+03:00'
+                updatedAt: '2026-10-19T12:01:05+03:00'
+                completedAt: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/TransferNotFound'
+  /v1/transfers/{transferId}/cancel:
+    post:
+      tags: [Переводы]
+      operationId: cancelTransfer
+      summary: Отменить перевод на проверке
+      description: |
+        Отменить можно только перевод в статусе ON_REVIEW (TR-22). Повторная отмена отменённого
+        перевода возвращает 200 и тот же перевод, поэтому ключ идемпотентности не нужен.
+        Если одновременно пришло решение антифрода, применяется то, что зафиксировано первым (TR-23).
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+        - $ref: '#/components/parameters/Traceparent'
+      responses:
+        '200':
+          description: Перевод отменён, сумма разблокирована
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+              example:
+                id: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+                status: CANCELLED
+                rejectReason: null
+                amount:
+                  value: '150000.00'
+                  currency: RUB
+                recipient:
+                  displayName: Иван П.
+                sourceAccountId: 0b8e7d6c-5a4f-4e3d-9c2b-1a0f9e8d7c6b
+                comment: null
+                cancellable: false
+                createdAt: '2026-10-19T12:01:03+03:00'
+                updatedAt: '2026-10-19T12:20:41+03:00'
+                completedAt: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/TransferNotFound'
+        '409':
+          description: Перевод уже нельзя отменить
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://api.bank.example/problems/transfer-not-cancellable
+                title: Перевод уже нельзя отменить
+                status: 409
+                code: TRANSFER_NOT_CANCELLABLE
+                detail: Перевод уже выполнен.
+                currentStatus: COMPLETED
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  /v1/transfer-limits:
+    get:
+      tags: [Лимиты]
+      operationId: getTransferLimits
+      summary: Доступные лимиты отправителя
+      description: Суммы в рублях. В «использовано» входят и незавершённые переводы (TR-08).
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+      responses:
+        '200':
+          description: Лимиты
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferLimits'
+              example:
+                perOperation:
+                  value: '300000.00'
+                  currency: RUB
+                day:
+                  limit:
+                    value: '500000.00'
+                    currency: RUB
+                  used:
+                    value: '480000.00'
+                    currency: RUB
+                  available:
+                    value: '20000.00'
+                    currency: RUB
+                  resetsAt: '2026-10-20T00:00:00+03:00'
+                month:
+                  limit:
+                    value: '2000000.00'
+                    currency: RUB
+                  used:
+                    value: '640000.00'
+                    currency: RUB
+                  available:
+                    value: '1360000.00'
+                    currency: RUB
+                  resetsAt: '2026-11-01T00:00:00+03:00'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /internal/v1/antifraud/decisions:
+    post:
+      tags: [Внутренние]
+      operationId: receiveAntifraudDecision
+      summary: Решение антифрода по ручной проверке
+      description: |
+        Вызывает антифрод, когда сотрудник принял решение. Идемпотентно по `decisionId`.
+        Если перевод уже в финальном статусе (отменён отправителем или истёк срок проверки),
+        ответ — 200 с `applied: false` и текущим статусом: антифроду нечего исправлять,
+        ему нужно только закрыть кейс. Ошибка 4xx тут бесполезна, на неё нельзя отреагировать.
+      security:
+        - antifraudMtls: []
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AntifraudDecision'
+            example:
+              decisionId: 9c8b7a6f-5e4d-4c3b-8a2f-1e0d9c8b7a6f
+              transferId: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+              decision: ALLOW
+              decidedAt: '2026-10-19T12:20:40+03:00'
+              reasonCode: null
+      responses:
+        '200':
+          description: Решение принято к сведению
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AntifraudDecisionResult'
+              examples:
+                applied:
+                  summary: Решение применено
+                  value:
+                    applied: true
+                    transferStatus: PROCESSING
+                tooLate:
+                  summary: Перевод уже отменён отправителем
+                  value:
+                    applied: false
+                    transferStatus: CANCELLED
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/TransferNotFound'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен приложения. Отправитель берётся из токена.
+    antifraudMtls:
+      type: mutualTLS
+      description: Взаимный TLS, сертификат системы антифрода из доверенного списка
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        UUID, который приложение создаёт один раз на экране подтверждения и повторяет
+        при любой сетевой ошибке (TR-10). Уникален в пределах отправителя.
+      schema:
+        type: string
+        format: uuid
+      example: 5f0e6a2b-7c1d-4e8f-9a3b-2c4d6e8f0a1b
+    DeviceId:
+      name: X-Device-Id
+      in: header
+      required: true
+      description: Идентификатор устройства, нужен антифроду
+      schema:
+        type: string
+        maxLength: 128
+      example: ios-7F3A9C21-5B8E
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context. Если нет, шлюз создаёт новый.
+      schema:
+        type: string
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    TransferId:
+      name: transferId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      example: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+  headers:
+    RetryAfter:
+      description: Через сколько секунд повторить
+      schema:
+        type: integer
+        minimum: 1
+      example: 30
+    IdempotentReplayed:
+      description: Ответ на повтор запроса с тем же ключом
+      schema:
+        type: string
+        enum: ['true']
+  examples:
+    ValidationError:
+      summary: Ошибка в данных
+      value:
+        type: https://api.bank.example/problems/validation-error
+        title: Ошибка в данных
+        status: 400
+        code: VALIDATION_ERROR
+        detail: Сумма должна быть больше нуля и не больше двух знаков после запятой.
+        errors:
+          - field: amount.value
+            message: Неверный формат суммы
+        traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  responses:
+    ValidationError:
+      description: Ошибка в данных запроса
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            validation:
+              $ref: '#/components/examples/ValidationError'
+    Unauthorized:
+      description: Нет или истёк токен доступа
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.bank.example/problems/unauthorized
+            title: Нужно войти заново
+            status: 401
+            code: UNAUTHORIZED
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    TransferNotFound:
+      description: Перевод не найден или принадлежит другому клиенту
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.bank.example/problems/transfer-not-found
+            title: Перевод не найден
+            status: 404
+            code: TRANSFER_NOT_FOUND
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    LookupRateLimited:
+      description: Слишком много поисков
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.bank.example/problems/lookup-rate-limited
+            title: Слишком много запросов
+            status: 429
+            code: LOOKUP_RATE_LIMITED
+            detail: Попробуйте через 2 минуты.
+            retryAfterSeconds: 120
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    ServiceUnavailable:
+      description: Зависимая система недоступна. Повторить с тем же ключом
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.bank.example/problems/service-unavailable
+            title: Сервис временно недоступен
+            status: 503
+            code: SERVICE_UNAVAILABLE
+            detail: Повторите запрос через несколько секунд.
+            retryAfterSeconds: 5
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  schemas:
+    Money:
+      type: object
+      required: [value, currency]
+      description: Сумма строкой, чтобы не терять копейки на числах с плавающей точкой
+      properties:
+        value:
+          type: string
+          pattern: '^\d{1,15}(\.\d{1,2})?$'
+          example: '1500.00'
+        currency:
+          $ref: '#/components/schemas/Currency'
+    Currency:
+      type: string
+      description: ISO 4217
+      enum: [RUB, USD, EUR, CNY]
+    RecipientLookupRequest:
+      type: object
+      required: [phone]
+      properties:
+        phone:
+          type: string
+          description: E.164, только российские номера
+          pattern: '^\+7\d{10}$'
+    RecipientLookup:
+      type: object
+      required: [recipientToken, displayName, currencies, expiresAt]
+      properties:
+        recipientToken:
+          type: string
+          format: uuid
+          description: Действует P-01 и только для этого отправителя (TR-02)
+        displayName:
+          type: string
+          description: Имя и первая буква фамилии
+          example: Иван П.
+        currencies:
+          type: array
+          description: Валюты, в которых у получателя есть основной счёт (TR-05)
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Currency'
+        expiresAt:
+          type: string
+          format: date-time
+    CreateTransferRequest:
+      type: object
+      required: [recipientToken, sourceAccountId, amount]
+      properties:
+        recipientToken:
+          type: string
+          format: uuid
+        sourceAccountId:
+          type: string
+          format: uuid
+        amount:
+          $ref: '#/components/schemas/Money'
+        comment:
+          type: [string, 'null']
+          maxLength: 140
+    TransferStatus:
+      type: string
+      description: |
+        Статус для клиента. Внутренние статусы сервиса отображаются так:
+        NEW, HELD, CHECKING, POSTING → PROCESSING; REVIEW → ON_REVIEW;
+        остальные совпадают. См. статусную модель.
+      enum: [PROCESSING, ON_REVIEW, COMPLETED, REJECTED, CANCELLED, FAILED]
+    RejectReason:
+      type: string
+      enum:
+        - INSUFFICIENT_FUNDS
+        - FRAUD_SUSPECTED
+        - REVIEW_EXPIRED
+        - RECIPIENT_ACCOUNT_UNAVAILABLE
+    Transfer:
+      type: object
+      required: [id, status, amount, recipient, sourceAccountId, cancellable, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/TransferStatus'
+        rejectReason:
+          description: Заполнено только для REJECTED
+          oneOf:
+            - $ref: '#/components/schemas/RejectReason'
+            - type: 'null'
+        amount:
+          $ref: '#/components/schemas/Money'
+        recipient:
+          type: object
+          required: [displayName]
+          properties:
+            displayName:
+              type: string
+        sourceAccountId:
+          type: string
+          format: uuid
+        comment:
+          type: [string, 'null']
+        cancellable:
+          type: boolean
+          description: Можно ли отменить прямо сейчас
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: [string, 'null']
+          format: date-time
+    LimitPeriod:
+      type: object
+      required: [limit, used, available, resetsAt]
+      properties:
+        limit:
+          $ref: '#/components/schemas/Money'
+        used:
+          $ref: '#/components/schemas/Money'
+        available:
+          $ref: '#/components/schemas/Money'
+        resetsAt:
+          type: string
+          format: date-time
+    TransferLimits:
+      type: object
+      required: [perOperation, day, month]
+      properties:
+        perOperation:
+          $ref: '#/components/schemas/Money'
+        day:
+          $ref: '#/components/schemas/LimitPeriod'
+        month:
+          $ref: '#/components/schemas/LimitPeriod'
+    AntifraudDecision:
+      type: object
+      required: [decisionId, transferId, decision, decidedAt]
+      properties:
+        decisionId:
+          type: string
+          format: uuid
+        transferId:
+          type: string
+          format: uuid
+        decision:
+          type: string
+          enum: [ALLOW, DENY]
+        decidedAt:
+          type: string
+          format: date-time
+        reasonCode:
+          type: [string, 'null']
+    AntifraudDecisionResult:
+      type: object
+      required: [applied, transferStatus]
+      properties:
+        applied:
+          type: boolean
+          description: false — перевод уже был в финальном статусе
+        transferStatus:
+          $ref: '#/components/schemas/TransferStatus'
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details плюс машиночитаемый код
+      required: [type, title, status, code, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+          description: Текст для человека, приложение может показать его как есть
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          type: string
+          description: Машиночитаемый код, по нему приложение решает, что делать
+          enum:
+            - VALIDATION_ERROR
+            - UNAUTHORIZED
+            - ACCOUNT_NOT_OWNED
+            - RECIPIENT_NOT_FOUND
+            - SELF_TRANSFER
+            - LOOKUP_RATE_LIMITED
+            - IDEMPOTENCY_KEY_REQUIRED
+            - IDEMPOTENCY_KEY_IN_PROGRESS
+            - IDEMPOTENCY_KEY_REUSED
+            - IDEMPOTENCY_KEY_EXPIRED
+            - RECIPIENT_TOKEN_EXPIRED
+            - LIMIT_EXCEEDED
+            - INSUFFICIENT_FUNDS
+            - RECIPIENT_CURRENCY_UNAVAILABLE
+            - SOURCE_ACCOUNT_UNAVAILABLE
+            - TRANSFER_NOT_FOUND
+            - TRANSFER_NOT_CANCELLABLE
+            - SERVICE_UNAVAILABLE
+        traceId:
+          type: string
+          description: Для обращения в поддержку
+        retryAfterSeconds:
+          type: integer
+        currentStatus:
+          $ref: '#/components/schemas/TransferStatus'
+        limit:
+          type: object
+          required: [period, available]
+          properties:
+            period:
+              type: string
+              enum: [OPERATION, DAY, MONTH]
+            available:
+              $ref: '#/components/schemas/Money'
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string

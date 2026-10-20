@@ -1,0 +1,142 @@
+# Модель данных
+
+Версия 0.2. DDL — [`ddl.sql`](ddl.sql), PostgreSQL 16. Две схемы соответствуют двум базам двух сервисов: `ledger` и `transfers`. Внешних ключей между ними нет: в проде это разные базы, связь — через [API леджера](../integrations/ledger.md).
+
+Правила, которые можно гарантировать в базе, гарантируются в базе, а не обещаются в документе. Это проверяют [`ddl-checks.sql`](ddl-checks.sql) и [`concurrency-check.sh`](concurrency-check.sh).
+
+## Как проверить
+
+```bash
+createdb pt_check
+psql -v ON_ERROR_STOP=1 -d pt_check -f ddl.sql -f ddl-checks.sql   # 14 проверок, «Все проверки пройдены»
+DB=pt_check ./concurrency-check.sh                                 # гонка за лимит в двух сессиях
+```
+
+## Леджер
+
+```mermaid
+erDiagram
+  ACCOUNT ||--o{ HOLD : "блокировки"
+  ACCOUNT ||--o{ POSTING : "дебет"
+  ACCOUNT ||--o{ POSTING : "кредит"
+  POSTING |o--o| POSTING : "сторно"
+  ACCOUNT {
+    uuid id PK
+    uuid client_id
+    text type "CLIENT_CURRENT или BANK_TECHNICAL"
+    char currency
+    bool is_primary
+    text status "OPEN, BLOCKED, CLOSED"
+    numeric balance "проекция проводок"
+  }
+  HOLD {
+    uuid id PK
+    uuid transfer_id UK
+    uuid account_id FK
+    numeric amount
+    text status "ACTIVE, RELEASED, CAPTURED"
+  }
+  POSTING {
+    uuid id PK
+    text kind "TRANSFER, REVERSAL, OTHER"
+    uuid transfer_id
+    uuid debit_account_id FK
+    uuid credit_account_id FK
+    numeric amount
+    uuid reverses_posting_id FK
+  }
+```
+
+Проводка — одна строка «дебет — кредит — сумма». Поэтому равенство дебета и кредита выполняется по построению, его не нужно проверять отдельно. Баланс счёта — проекция суммы проводок: его меняет триггер в той же транзакции, что и проводка, а ежедневная сверка (итерация 3) проверяет, что проекция совпадает с суммой.
+
+Счета не удаляются физически, только переходят в CLOSED. Поэтому внешние ключи без каскадов: удалять нечего, и каскад был бы мёртвой декларацией.
+
+## Сервис переводов
+
+```mermaid
+erDiagram
+  TRANSFER ||--o{ OUTBOX_EVENT : "события"
+  TRANSFER ||--o{ ANTIFRAUD_CHECK : "проверки"
+  STATUS_TRANSITION }o--o{ TRANSFER : "разрешает переходы"
+  TRANSFER {
+    uuid id PK
+    uuid sender_client_id
+    uuid idempotency_key "UK вместе с отправителем"
+    text request_hash
+    numeric amount
+    numeric amount_rub
+    date limit_day
+    text status
+    int version
+  }
+  LIMIT_USAGE {
+    uuid sender_client_id PK
+    text period PK "DAY или MONTH"
+    date period_start PK
+    numeric reserved
+    numeric used
+  }
+  RECIPIENT_TOKEN {
+    uuid token PK
+    uuid sender_client_id
+    uuid recipient_client_id
+    timestamptz expires_at
+  }
+  CURRENCY_RATE {
+    char currency PK
+    date rate_date PK
+    int nominal
+    numeric rate
+  }
+  OUTBOX_EVENT {
+    uuid event_id PK
+    uuid transfer_id FK
+    int transfer_version "UK вместе с переводом"
+    jsonb payload
+    timestamptz published_at
+  }
+  ANTIFRAUD_CHECK {
+    uuid transfer_id PK
+    int attempt PK
+    text outcome
+    uuid decision_id UK
+  }
+```
+
+## Правило → механизм → проверка
+
+| Правило | Механизм в базе | Чем проверено |
+|---|---|---|
+| TR-02, TR-04 Токен только для того, кто искал; не себе | `recipient_token.sender_client_id`, CHECK отправитель ≠ получатель | ревью |
+| TR-05 Один основной счёт в валюте | Частичный уникальный индекс `account_one_primary_per_currency` | ревью |
+| TR-08 Лимит с учётом незавершённых, атомарно | `reserve_limit`: блокировка строк DAY и MONTH в одном порядке, проверка `reserved + used + сумма` | ddl-checks, concurrency-check |
+| TR-09 Отказ возвращает лимит | Триггер `settle_limit` при переходе в финальный статус: резерв уменьшается, у COMPLETED растёт использованное | ddl-checks |
+| TR-11 Повтор с тем же ключом | UNIQUE (`sender_client_id`, `idempotency_key`) и `request_hash`: сервис отличает повтор от другого перевода с тем же ключом | ddl-checks |
+| TR-12 Холд не больше доступного остатка | `place_hold` блокирует строку счёта и считает остаток за вычетом активных холдов | ddl-checks |
+| TR-14 Списание и зачисление одной операцией | `post_transfer`: проводка и списание холда в одной транзакции | ddl-checks |
+| TR-15 Проводки неизменяемы, исправления сторно | Триггеры на UPDATE, DELETE, TRUNCATE; триггер `check_reversal` требует зеркального сторно | ddl-checks |
+| TR-16 Операции леджера идемпотентны | UNIQUE `hold.transfer_id`, UNIQUE (`posting.transfer_id`, `kind`); функции возвращают результат первой операции | ddl-checks |
+| TR-18 Счёт получателя недоступен | `post_transfer` возвращает RECIPIENT_ACCOUNT_UNAVAILABLE и не проводит | ddl-checks |
+| TR-24 Операция в валюте счёта | Составные FK (`account_id`, `currency`) → `account (id, currency)` | ddl-checks |
+| TR-27 Статус и событие в одной транзакции | Триггер `emit_event` пишет в `outbox_event`; UNIQUE (`transfer_id`, `transfer_version`) | ddl-checks |
+| TR-29 Порядок событий одного перевода | `version` растёт на 1 при каждом изменении (триггер `guard_transfer`), уходит в событие как `transferVersion` | ddl-checks |
+| Статусная модель | Таблица `status_transition` и триггер `guard_transfer`: запрещённый переход — ошибка, реквизиты перевода не меняются | ddl-checks |
+| TR-23 Отмена против одобрения | Условное обновление `… WHERE status = 'REVIEW'`: проигравшая сторона обновляет 0 строк и читает текущий статус | ddl-checks |
+
+## Протокол блокировок
+
+| Операция | Что блокируется | Зачем |
+|---|---|---|
+| Резерв лимита | Строки `limit_usage` DAY, затем MONTH | Параллельные переводы одного отправителя выстраиваются в очередь, порядок исключает взаимоблокировку |
+| Холд | Строка счёта списания | Два холда не потратят один и тот же остаток |
+| Проводка | Строка холда, затем оба счёта в порядке `id` | Встречные переводы A→B и B→A не блокируют друг друга навсегда |
+| Смена статуса перевода | Строка перевода, условие на текущий статус | Гонки решает первое зафиксированное изменение |
+
+## Решения по данным
+
+- **Суммы** — `numeric(19,2)`, в API — строка. Числа с плавающей точкой теряют копейки.
+- **Рублёвый эквивалент** для лимитов считается при создании перевода: `amount × rate / nominal`, округление до копеек, половина — от нуля. Курс берётся на дату операции, дата сохраняется в `rate_date`.
+- **Период лимита** фиксируется при создании (`limit_day`, `limit_month`). Перевод, созданный в 23:59 31-го числа и выполненный 1-го, расходует лимит октября, а не ноября.
+- **Ключ идемпотентности** хранится вместе с переводом и уникален всегда. Повтор в течение P-07 возвращает перевод. После P-07 тот же ключ получает отказ IDEMPOTENCY_KEY_EXPIRED, нового перевода не создаётся.
+- **Отказ по лимиту** записывается сразу в REJECTED, без резерва и без событий: клиент получил отказ в ответе на запрос, а запись нужна, чтобы повтор с тем же ключом вернул тот же отказ.
+- **Хранение**: переводы и проводки не удаляются, срок хранения — [NFR-09](../requirements/nfr.md).
