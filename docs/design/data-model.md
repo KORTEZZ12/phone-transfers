@@ -97,6 +97,7 @@ erDiagram
   }
   OUTBOX_EVENT {
     uuid event_id PK
+    bigint seq UK "порядок выборки relay"
     uuid transfer_id FK
     int transfer_version "UK вместе с переводом"
     jsonb payload
@@ -136,7 +137,7 @@ erDiagram
 | TR-18 Счёт получателя или отправителя недоступен | `post_transfer` блокирует оба счёта, проверяет статусы и возвращает RECIPIENT_ACCOUNT_UNAVAILABLE или SOURCE_ACCOUNT_UNAVAILABLE, не проводя | ddl-checks |
 | TR-24 Операция в валюте счёта | Составные FK (`account_id`, `currency`) → `account (id, currency)` | ddl-checks |
 | TR-27 Статус и событие в одной транзакции | Триггер `emit_event` пишет в `outbox_event`; UNIQUE (`transfer_id`, `transfer_version`) | ddl-checks |
-| TR-29 Порядок событий одного перевода | `version` растёт на 1 при каждом изменении (триггер `guard_transfer`), уходит в событие как `transferVersion` | ddl-checks |
+| TR-29 Порядок событий одного перевода | `version` растёт на 1 при каждом изменении (триггер `guard_transfer`), уходит в событие как `transferVersion`; в потоке событий номера идут с пропусками. Relay выбирает по `seq`, `occurredAt` — момент изменения | ddl-checks |
 | Статусная модель | Таблица `status_transition` и триггер `guard_transfer`: запрещённый переход — ошибка, реквизиты перевода не меняются | ddl-checks |
 | TR-17, TR-30 Следующий шаг не теряется | Триггер `enqueue_task` ставит задачу тем же переходом статуса; `retry_task` — пауза P-17; представление `attention` — что найдёт регламентная проверка | ddl-checks |
 | TR-23 Отмена против одобрения | Условное обновление `… WHERE status = 'REVIEW'`: проигравшая сторона обновляет 0 строк и читает текущий статус | ddl-checks |

@@ -416,15 +416,18 @@ CREATE TRIGGER transfer_settle_limit AFTER UPDATE OF status ON transfers.transfe
 -- который видит клиент. Отказ при создании событий не порождает: клиент получил его в ответе
 CREATE TABLE transfers.outbox_event (
     event_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    seq               bigint GENERATED ALWAYS AS IDENTITY UNIQUE,  -- порядок выборки relay
     transfer_id       uuid NOT NULL REFERENCES transfers.transfer (id),
     transfer_version  integer NOT NULL,
     event_type        text NOT NULL,
     payload           jsonb NOT NULL,
-    created_at        timestamptz NOT NULL DEFAULT now(),
+    created_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
     published_at      timestamptz,
     UNIQUE (transfer_id, transfer_version)
 );
-CREATE INDEX outbox_unpublished ON transfers.outbox_event (created_at) WHERE published_at IS NULL;
+-- Relay выбирает по seq, а не по времени: now() — начало транзакции, и у позднего изменения оно
+-- может оказаться раньше. Внутри перевода seq идёт в порядке версий: изменения перевода выполняются по очереди
+CREATE INDEX outbox_unpublished ON transfers.outbox_event (seq) WHERE published_at IS NULL;
 
 CREATE FUNCTION transfers.emit_event() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
@@ -438,7 +441,7 @@ BEGIN
     INSERT INTO transfers.outbox_event (event_id, transfer_id, transfer_version, event_type, payload)
     VALUES (e, NEW.id, NEW.version, 'TransferStatusChanged', jsonb_build_object(
         'eventId', e,
-        'occurredAt', now(),
+        'occurredAt', clock_timestamp(),            -- момент изменения, а не начало транзакции
         'transferId', NEW.id,
         'transferVersion', NEW.version,
         'status', cur,
