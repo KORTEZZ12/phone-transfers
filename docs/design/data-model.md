@@ -62,6 +62,7 @@ erDiagram
 ```mermaid
 erDiagram
   TRANSFER ||--o{ OUTBOX_EVENT : "события"
+  TRANSFER ||--o{ TASK : "задачи продолжения"
   TRANSFER ||--o{ ANTIFRAUD_CHECK : "проверки"
   STATUS_TRANSITION }o--o{ TRANSFER : "разрешает переходы"
   TRANSFER {
@@ -101,6 +102,14 @@ erDiagram
     jsonb payload
     timestamptz published_at
   }
+  TASK {
+    bigint id PK
+    uuid transfer_id FK
+    text kind "ANTIFRAUD_CHECK, POST, RELEASE_HOLD"
+    timestamptz due_at
+    int attempts
+    timestamptz done_at
+  }
   ANTIFRAUD_CHECK {
     uuid transfer_id PK
     int attempt PK
@@ -129,6 +138,7 @@ erDiagram
 | TR-27 Статус и событие в одной транзакции | Триггер `emit_event` пишет в `outbox_event`; UNIQUE (`transfer_id`, `transfer_version`) | ddl-checks |
 | TR-29 Порядок событий одного перевода | `version` растёт на 1 при каждом изменении (триггер `guard_transfer`), уходит в событие как `transferVersion` | ddl-checks |
 | Статусная модель | Таблица `status_transition` и триггер `guard_transfer`: запрещённый переход — ошибка, реквизиты перевода не меняются | ddl-checks |
+| TR-17, TR-30 Следующий шаг не теряется | Триггер `enqueue_task` ставит задачу тем же переходом статуса; `retry_task` — пауза P-17; представление `attention` — что найдёт регламентная проверка | ddl-checks |
 | TR-23 Отмена против одобрения | Условное обновление `… WHERE status = 'REVIEW'`: проигравшая сторона обновляет 0 строк и читает текущий статус | ddl-checks |
 
 ## Протокол блокировок
@@ -142,6 +152,7 @@ erDiagram
 
 Почему `FOR NO KEY UPDATE`, а не `FOR UPDATE`. Внешние ключи проводки при вставке берут на счета `FOR KEY SHARE`. `FOR UPDATE` с ней конфликтует: две проводки с общим счётом держат по KEY SHARE и ждут друг друга. До версии 0.3 так и было, из 90 одновременных проводок одному получателю 68 падали с deadlock. `FOR NO KEY UPDATE` с KEY SHARE не конфликтует, а проводки по одному счёту по-прежнему выстраивает в очередь. Проверяет [`ledger-concurrency-check.sh`](ledger-concurrency-check.sh).
 | Смена статуса перевода | Строка перевода, условие на текущий статус | Гонки решает первое зафиксированное изменение |
+| Задача продолжения | Строка задачи, занятые исполнители пропускают (`SKIP LOCKED`) | Несколько исполнителей не берут одну задачу |
 
 ## Решения по данным
 
