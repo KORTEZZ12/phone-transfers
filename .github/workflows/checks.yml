@@ -54,6 +54,12 @@ jobs:
       - name: Гонка за лимит
         working-directory: docs/design
         run: ./concurrency-check.sh
+      - name: Параллельные операции леджера без взаимоблокировок
+        working-directory: docs/design
+        run: |
+          createdb pt_conc
+          psql -X -q -v ON_ERROR_STOP=1 -d pt_conc -f ddl.sql
+          DB=pt_conc ./ledger-concurrency-check.sh
 
   docs:
     name: Ссылки в документации

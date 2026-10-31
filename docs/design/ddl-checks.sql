@@ -86,6 +86,47 @@ DO $$ BEGIN
   END;
 END $$;
 
+-- TR-16: снятие холда раньше самого холда закрывает операцию, запоздавший холд не появляется
+DO $$ BEGIN
+  ASSERT ledger.release_hold('30000000-0000-0000-0000-000000000004') = 'NO_HOLD';
+  ASSERT ledger.place_hold('30000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-0000000000a1', 'RUB', 100) = 'ALREADY_RELEASED';
+  ASSERT NOT EXISTS (SELECT 1 FROM ledger.hold WHERE transfer_id = '30000000-0000-0000-0000-000000000004');
+  RAISE NOTICE 'ok  TR-16 запоздавший холд после снятия не создаётся';
+END $$;
+
+-- TR-18: счёт отправителя заблокировали после холда — проводки нет, холд снимается
+INSERT INTO ledger.account (id, client_id, type, currency, is_primary, status) VALUES
+ ('00000000-0000-0000-0000-0000000000a4', '10000000-0000-0000-0000-000000000001', 'CLIENT_CURRENT', 'RUB', false, 'OPEN');
+INSERT INTO ledger.posting (kind, debit_account_id, credit_account_id, currency, amount)
+VALUES ('OTHER', '00000000-0000-0000-0000-0000000000b0', '00000000-0000-0000-0000-0000000000a4', 'RUB', 500);
+
+DO $$ BEGIN
+  ASSERT ledger.place_hold('30000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-0000000000a4', 'RUB', 200) = 'HELD';
+  UPDATE ledger.account SET status = 'BLOCKED' WHERE id = '00000000-0000-0000-0000-0000000000a4';
+  ASSERT ledger.post_transfer('30000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-0000000000a2') = 'SOURCE_ACCOUNT_UNAVAILABLE';
+  ASSERT ledger.release_hold('30000000-0000-0000-0000-000000000005') = 'RELEASED';
+  ASSERT (SELECT balance FROM ledger.account WHERE id = '00000000-0000-0000-0000-0000000000a4') = 500;
+  RAISE NOTICE 'ok  TR-18 со счёта, заблокированного после холда, не списывается';
+END $$;
+
+-- Баланс — проекция проводок: без проводки его не изменить, счёт открывается с нулём
+DO $$ BEGIN
+  BEGIN
+    UPDATE ledger.account SET balance = balance + 1000 WHERE id = '00000000-0000-0000-0000-0000000000a2';
+    RAISE EXCEPTION 'баланс удалось изменить без проводки';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM LIKE 'баланс удалось%' THEN RAISE; END IF;
+  END;
+  BEGIN
+    INSERT INTO ledger.account (id, client_id, type, currency, is_primary, status, balance)
+    VALUES ('00000000-0000-0000-0000-0000000000a9', '90000000-0000-0000-0000-000000000009', 'CLIENT_CURRENT', 'RUB', true, 'OPEN', 777);
+    RAISE EXCEPTION 'счёт открыт с балансом без проводки';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM LIKE 'счёт открыт%' THEN RAISE; END IF;
+  END;
+  RAISE NOTICE 'ok  баланс меняется только проводкой, счёт открывается с нулём';
+END $$;
+
 -- Сервис переводов: перевод 1 500 ₽ проходит путь до COMPLETED
 INSERT INTO transfers.limit_usage VALUES
  ('10000000-0000-0000-0000-000000000001', 'DAY',   DATE '2026-10-19', 0, 490000),
