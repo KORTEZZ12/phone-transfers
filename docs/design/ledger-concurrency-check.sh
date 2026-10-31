@@ -4,6 +4,8 @@
 #   1. 30 одновременных проводок одному получателю (сбор денег на подарок)
 #   2. 20 пар встречных проводок A→B и B→A
 #   3. 20 проводок и 20 новых холдов по тем же счетам отправителей одновременно
+# Сценарии идут по очереди, в каждом не больше 40 соединений: по умолчанию в PostgreSQL
+# max_connections = 100, и 110 соединений разом упирались в лимит, а не в блокировки.
 # До версии 0.3 сценарии 1 и 2 давали deadlock detected: FOR UPDATE в apply_posting
 # конфликтовал с FOR KEY SHARE, которую берут внешние ключи проводки.
 set -uo pipefail
@@ -32,18 +34,25 @@ SELECT count(*) FROM (
 ) s;
 SQL
 
-START=$(q -c "SELECT (clock_timestamp() + interval '2 seconds')::text")
-run() { ( q -c "SELECT pg_sleep_until('$START')" -c "$2" > "$WORK/$1.txt" 2>&1 ) & }
-for i in $(seq 1 $N1); do run "s1-$i" "SELECT ledger.post_transfer($(id t1-$i), $(id rcpt))"; done
+# Пачка сессий: строки «имя SQL» на входе, все сессии стартуют одновременно через 5 с
+batch() {
+  local start name sql
+  start=$(q -c "SELECT (clock_timestamp() + interval '5 seconds')::text")
+  while read -r name sql; do
+    ( q -c "SELECT pg_sleep_until('$start')" -c "$sql" > "$WORK/$name.txt" 2>&1 ) &
+  done
+  wait
+}
+
+for i in $(seq 1 $N1); do echo "s1-$i SELECT ledger.post_transfer($(id t1-$i), $(id rcpt))"; done | batch
 for i in $(seq 1 $N2); do
-  run "s2a-$i" "SELECT ledger.post_transfer($(id t2a-$i), $(id b2-$i))"
-  run "s2b-$i" "SELECT ledger.post_transfer($(id t2b-$i), $(id a2-$i))"
-done
+  echo "s2a-$i SELECT ledger.post_transfer($(id t2a-$i), $(id b2-$i))"
+  echo "s2b-$i SELECT ledger.post_transfer($(id t2b-$i), $(id a2-$i))"
+done | batch
 for i in $(seq 1 $N3); do
-  run "s3p-$i" "SELECT ledger.post_transfer($(id t3-$i), $(id rcpt))"
-  run "s3h-$i" "SELECT ledger.place_hold($(id t3new-$i), $(id s3-$i), 'RUB', 100)"
-done
-wait
+  echo "s3p-$i SELECT ledger.post_transfer($(id t3-$i), $(id rcpt))"
+  echo "s3h-$i SELECT ledger.place_hold($(id t3new-$i), $(id s3-$i), 'RUB', 100)"
+done | batch
 
 deadlocks=$(grep -l 'deadlock detected' "$WORK"/*.txt | wc -l)
 posted=$(grep -lx 'POSTED' "$WORK"/*.txt | wc -l)
@@ -52,6 +61,8 @@ expected_posted=$((N1 + 2 * N2 + N3))
 balance=$(q -c "SELECT balance FROM ledger.account WHERE id = $(id rcpt)")
 echo "проводок POSTED: $posted из $expected_posted, новых холдов: $held из $N3, deadlock: $deadlocks"
 echo "баланс получателя: $balance (ожидается $(( (N1 + N3) * 100 )).00)"
+errors=$(grep -h -E 'ERROR|FATAL' "$WORK"/*.txt | sed 's/^psql:[^ ]* //' | sort | uniq -c)
+[ -n "$errors" ] && { echo "ошибки сессий:"; echo "$errors"; }
 rm -rf "$WORK"
 if [ "$deadlocks" -eq 0 ] && [ "$posted" -eq "$expected_posted" ] && [ "$held" -eq "$N3" ] && [ "$balance" = "$(( (N1 + N3) * 100 )).00" ]; then
   echo "ok  параллельные операции леджера без взаимоблокировок"
