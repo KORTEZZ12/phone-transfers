@@ -1,16 +1,17 @@
 # Соглашения API
 
-Версия 0.2. Контракты: [`openapi.yaml`](openapi.yaml) — API для приложения и колбэк антифрода, [`asyncapi.yaml`](asyncapi.yaml) — события в Kafka.
+Версия 0.3. Контракты: [`openapi.yaml`](openapi.yaml) — API для приложения, [`internal-antifraud.yaml`](internal-antifraud.yaml) — колбэк антифрода во внутреннем контуре, [`asyncapi.yaml`](asyncapi.yaml) — события в Kafka. Документация публичного API — [`index.html`](index.html), её публикует GitHub Pages.
 
 ## Проверка контрактов
 
 ```bash
-npx @redocly/cli lint openapi.yaml                 # схема, ссылки, соответствие примеров схемам
-npx @redocly/cli build-docs openapi.yaml           # HTML-документация для GitHub Pages
-npx @stoplight/prism-cli mock openapi.yaml         # mock-сервер по примерам из контракта
+npx @redocly/cli@2.72.1 lint openapi.yaml internal-antifraud.yaml       # схема, ссылки, примеры против схем
+npx @redocly/cli@2.72.1 build-docs openapi.yaml -o index.html             # HTML-документация для GitHub Pages
+npx @stoplight/prism-cli mock openapi.yaml                                # mock-сервер по примерам из контракта
+npm install --no-save @asyncapi/parser@3.6.6 && node ../../scripts/validate-asyncapi.mjs asyncapi.yaml
 ```
 
-AsyncAPI проверяется официальным парсером `@asyncapi/parser`: спецификация 3.1.0, без ошибок и предупреждений.
+Всё это, кроме mock-сервера, CI запускает на каждый PR.
 
 ## Аутентификация
 
@@ -57,9 +58,23 @@ AsyncAPI проверяется официальным парсером `@asynca
 | SOURCE_ACCOUNT_UNAVAILABLE | 422 | Счёт списания заблокирован или закрыт | Предлагает другой счёт |
 | IDEMPOTENCY_KEY_REUSED | 422 | Тот же ключ, другие данные | Показывает перевод `existingTransferId`, пишет дефект в мониторинг, сам не переотправляет |
 | LOOKUP_RATE_LIMITED | 429 | Слишком много поисков | Показывает таймер по `Retry-After` |
-| SERVICE_UNAVAILABLE | 503 | Зависимая система недоступна | Повторяет через `Retry-After` с тем же ключом |
+| SERVICE_UNAVAILABLE | 503 | Любая операция: сбой или недоступность зависимой системы | Повторяет через `Retry-After` с тем же ключом по TR-10 |
 
-Асинхронные отказы приходят не ошибкой, а статусом REJECTED с `rejectReason`: FRAUD_SUSPECTED, REVIEW_EXPIRED, RECIPIENT_ACCOUNT_UNAVAILABLE, NOT_CONFIRMED.
+Ответ 503 одинаков для всех операций, поэтому в операциях он отдельно не описан: серверные сбои и обрыв связи приложение обрабатывает одинаково, повтором с тем же ключом.
+
+## Причины отказа
+
+Один список для модели данных, ресурса перевода и событий. Синхронный отказ приходит ответом 422 до блокировки средств, асинхронный — статусом REJECTED с `rejectReason` в ресурсе и событии.
+
+| Причина | Как приходит | Когда |
+|---|---|---|
+| LIMIT_EXCEEDED | 422 | Лимит на операцию, сутки или месяц |
+| INSUFFICIENT_FUNDS | 422 | Не хватает доступного остатка для холда |
+| SOURCE_ACCOUNT_UNAVAILABLE | 422 или REJECTED | Счёт списания закрыт или заблокирован: до холда — 422, после холда — REJECTED |
+| FRAUD_SUSPECTED | REJECTED | Антифрод или сотрудник отклонил |
+| REVIEW_EXPIRED | REJECTED | Ручная проверка не закончилась за P-11 |
+| NOT_CONFIRMED | REJECTED | Клиент не подтвердил приостановленный перевод за P-20 |
+| RECIPIENT_ACCOUNT_UNAVAILABLE | REJECTED | Счёт получателя закрыли или заблокировали до проводки |
 
 ## Версии
 

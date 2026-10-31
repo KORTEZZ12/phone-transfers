@@ -268,7 +268,8 @@ CREATE TABLE transfers.transfer (
     reject_reason        text CHECK (reject_reason IN
                              ('LIMIT_EXCEEDED', 'INSUFFICIENT_FUNDS', 'SOURCE_ACCOUNT_UNAVAILABLE',
                               'FRAUD_SUSPECTED', 'REVIEW_EXPIRED', 'RECIPIENT_ACCOUNT_UNAVAILABLE',
-                              'NOT_CONFIRMED')),
+                              'NOT_CONFIRMED')),   -- LIMIT_EXCEEDED, INSUFFICIENT_FUNDS и отказ счёта до холда
+                                                    -- клиент получает синхронно ответом 422
     version              integer NOT NULL DEFAULT 1,    -- transferVersion в событиях
     review_deadline      timestamptz,
     lease_until          timestamptz,                   -- аренда обработки P-14 (TR-34)
