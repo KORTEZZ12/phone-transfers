@@ -103,9 +103,15 @@ paths:
         Синхронно: проверка лимита, его резерв и блокировка суммы на счёте (TR-08, TR-12, TR-13).
         Дальше асинхронно: антифрод и проводка. Итог — в `GET /v1/transfers/{transferId}` и пуше.
 
-        Повтор с тем же `Idempotency-Key` и тем же телом в течение P-07 возвращает тот же перевод
-        с актуальным статусом и заголовком `Idempotent-Replayed: true`. Если исходный запрос
-        был отклонён, повтор возвращает тот же отказ (TR-11).
+        Порядок проверок (TR-11):
+        1. Токен доступа и формат запроса — 401, 400.
+        2. `Idempotency-Key`. Если перевод с этим ключом уже есть, ответ строится только по нему:
+           200 с актуальным статусом и `Idempotent-Replayed: true`, тот же отказ, если исходный
+           запрос отклонён, 409, пока действует аренда первого запроса (TR-34), или 422
+           `IDEMPOTENCY_KEY_REUSED`, если тело другое. Срока у повтора нет.
+        3. Только для нового ключа: токен получателя, счёт списания, лимит, остаток.
+
+        Тело для сравнения нормализуется — правила в соглашениях API.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/DeviceId'
@@ -209,7 +215,7 @@ paths:
                 detail: С этого счёта нельзя переводить.
                 traceId: 4bf92f3577b34da6a3ce929d0e0e4736
         '409':
-          description: Запрос с этим ключом ещё обрабатывается
+          description: Первый запрос с этим ключом ещё выполняется, аренда P-14 (TR-34)
           headers:
             Retry-After:
               $ref: '#/components/headers/RetryAfter'
@@ -226,7 +232,7 @@ paths:
                 retryAfterSeconds: 1
                 traceId: 4bf92f3577b34da6a3ce929d0e0e4736
         '422':
-          description: Перевод отклонён до блокировки средств
+          description: Перевод отклонён до блокировки средств, или ключ уже использован с другими данными
           content:
             application/problem+json:
               schema:
@@ -268,10 +274,11 @@ paths:
                   summary: Ключ уже использован для другого перевода
                   value:
                     type: https://api.bank.example/problems/idempotency-key-reused
-                    title: Повторите перевод заново
+                    title: Ключ уже использован для другого перевода
                     status: 422
                     code: IDEMPOTENCY_KEY_REUSED
-                    detail: Этот ключ уже использован для перевода с другими данными.
+                    detail: Перевод с этим ключом уже создан с другими данными. Откройте его, повторно не отправляйте.
+                    existingTransferId: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
                     traceId: 4bf92f3577b34da6a3ce929d0e0e4736
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
@@ -472,7 +479,8 @@ components:
       required: true
       description: |
         UUID, который приложение создаёт один раз на экране подтверждения и повторяет
-        при любой сетевой ошибке (TR-10). Уникален в пределах отправителя.
+        по правилам TR-10. Уникален в пределах отправителя, хранится вместе с переводом,
+        повтор распознаётся без срока (TR-11).
       schema:
         type: string
         format: uuid
@@ -786,7 +794,6 @@ components:
             - IDEMPOTENCY_KEY_REQUIRED
             - IDEMPOTENCY_KEY_IN_PROGRESS
             - IDEMPOTENCY_KEY_REUSED
-            - IDEMPOTENCY_KEY_EXPIRED
             - RECIPIENT_TOKEN_EXPIRED
             - LIMIT_EXCEEDED
             - INSUFFICIENT_FUNDS
@@ -802,6 +809,10 @@ components:
           type: integer
         currentStatus:
           $ref: '#/components/schemas/TransferStatus'
+        existingTransferId:
+          type: string
+          format: uuid
+          description: Перевод, уже созданный с этим ключом. Есть только у IDEMPOTENCY_KEY_REUSED
         limit:
           type: object
           required: [period, available]

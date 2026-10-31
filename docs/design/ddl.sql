@@ -267,6 +267,7 @@ CREATE TABLE transfers.transfer (
                               'FRAUD_SUSPECTED', 'REVIEW_EXPIRED', 'RECIPIENT_ACCOUNT_UNAVAILABLE')),
     version              integer NOT NULL DEFAULT 1,    -- transferVersion в событиях
     review_deadline      timestamptz,
+    lease_until          timestamptz,                   -- аренда обработки P-14 (TR-34)
     created_at           timestamptz NOT NULL DEFAULT now(),
     updated_at           timestamptz NOT NULL DEFAULT now(),
     completed_at         timestamptz,
@@ -336,6 +337,17 @@ BEGIN
 END $$;
 CREATE TRIGGER transfer_guard BEFORE INSERT OR UPDATE ON transfers.transfer
     FOR EACH ROW EXECUTE FUNCTION transfers.guard_transfer();
+
+-- Аренда обработки (TR-34): пока запрос или регламентная проверка ведёт перевод, повтор с тем же
+-- ключом получает 409. Перевод создаётся сразу с арендой; повтор после её окончания берёт аренду
+-- и продолжает обработку. Возвращает true, если аренду удалось взять
+CREATE FUNCTION transfers.take_lease(p_id uuid, p_ttl interval) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE transfers.transfer SET lease_until = clock_timestamp() + p_ttl
+     WHERE id = p_id AND NOT transfers.is_final(status)
+       AND (lease_until IS NULL OR lease_until < clock_timestamp());
+    RETURN FOUND;
+END $$;
 
 -- Лимиты: резерв при создании, расчёт при финальном статусе (TR-07, TR-08, TR-09)
 CREATE TABLE transfers.limit_usage (
