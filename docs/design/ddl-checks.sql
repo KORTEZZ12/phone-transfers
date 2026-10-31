@@ -229,6 +229,48 @@ BEGIN
   RAISE NOTICE 'ok  TR-23 отмена после одобрения не применяется, приложение получает текущий статус';
 END $$;
 
+-- TR-30, ADR-005: следующий шаг ставится тем же переходом статуса, финальный статус закрывает лишние задачи
+DO $$
+DECLARE due timestamptz;
+BEGIN
+  ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 100, 300000, 500000, 2000000) = 'OK';
+  INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+  VALUES ('40000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000001',
+          '50000000-0000-0000-0000-000000000005', 'h5', '20000000-0000-0000-0000-000000000002',
+          '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
+          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+  UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000005';
+  ASSERT EXISTS (SELECT 1 FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000005'
+                  AND kind = 'ANTIFRAUD_CHECK' AND done_at IS NULL), 'после холда должна стоять проверка антифродом';
+  UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000005';
+  UPDATE transfers.transfer SET status = 'REVIEW', review_deadline = now() + interval '48 hours'
+   WHERE id = '40000000-0000-0000-0000-000000000005';
+  due := transfers.retry_task((SELECT id FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000005'),
+                              'TIMEOUT', interval '5 minutes');
+  ASSERT due BETWEEN clock_timestamp() + interval '0.4 second' AND clock_timestamp() + interval '1.6 second',
+         'первый повтор — через 1 с ± 50%';
+  UPDATE transfers.transfer SET status = 'CANCELLED' WHERE id = '40000000-0000-0000-0000-000000000005';
+  ASSERT (SELECT outcome FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000005'
+           AND kind = 'ANTIFRAUD_CHECK') = 'NOT_NEEDED', 'отмена закрывает повтор проверки';
+  ASSERT EXISTS (SELECT 1 FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000005'
+                  AND kind = 'RELEASE_HOLD' AND done_at IS NULL), 'отмена ставит снятие холда в той же транзакции';
+  ASSERT NOT EXISTS (SELECT 1 FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000001'
+                      AND kind = 'RELEASE_HOLD'), 'у выполненного перевода снимать нечего';
+  RAISE NOTICE 'ok  TR-30 продолжение и снятие холда ставятся тем же переходом статуса';
+END $$;
+
+-- TR-30: регламентная проверка видит перевод без открытой задачи и долгий NEW
+DO $$ BEGIN
+  UPDATE transfers.task SET done_at = clock_timestamp(), outcome = 'LOST_FOR_TEST'
+   WHERE transfer_id = '40000000-0000-0000-0000-000000000003' AND done_at IS NULL;
+  ASSERT EXISTS (SELECT 1 FROM transfers.attention WHERE transfer_id = '40000000-0000-0000-0000-000000000003'
+                  AND reason = 'NO_OPEN_TASK'), 'POSTING без задачи — инцидент';
+  ASSERT NOT EXISTS (SELECT 1 FROM transfers.attention WHERE transfer_id = '40000000-0000-0000-0000-000000000005'),
+         'отменённый перевод внимания не требует';
+  RAISE NOTICE 'ok  TR-30 регламентная проверка находит перевод без открытой задачи';
+END $$;
+
 -- Маппинг ответа ЦБ (cbr-dailyinfo.md): фрагмент реального ответа GetCursOnDateXML от 19.10.2026.
 -- Обёртка в пространстве имён web.cbr.ru, сами курсы — без пространства имён (xmlns="")
 DO $$

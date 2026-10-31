@@ -441,6 +441,78 @@ END $$;
 CREATE TRIGGER transfer_emit_event AFTER UPDATE OF status ON transfers.transfer
     FOR EACH ROW EXECUTE FUNCTION transfers.emit_event();
 
+-- Задачи продолжения обработки (TR-30, ADR-005): что сделать с переводом дальше.
+-- Задача пишется в той же транзакции, что и статус, поэтому шаг не теряется, даже если сервис
+-- упал сразу после коммита. Исполнитель берёт задачи с наступившим due_at и повторяет по P-17
+CREATE TABLE transfers.task (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    transfer_id  uuid NOT NULL REFERENCES transfers.transfer (id),
+    kind         text NOT NULL CHECK (kind IN ('ANTIFRAUD_CHECK', 'POST', 'RELEASE_HOLD')),
+    due_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    attempts     integer NOT NULL DEFAULT 0,
+    last_error   text,
+    created_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
+    done_at      timestamptz,
+    outcome      text,
+    UNIQUE (transfer_id, kind),
+    CHECK ((done_at IS NULL) = (outcome IS NULL))
+);
+CREATE INDEX task_due ON transfers.task (due_at) WHERE done_at IS NULL;
+
+-- Следующий шаг ставится тем же переходом статуса:
+--   NEW → HELD — проверка антифродом; → POSTING — проводка;
+--   отказ, отмена или сбой после холда, а также NEW → FAILED — снятие холда.
+-- NEW → FAILED снимает холд, которого может ещё не быть: снятие закрывает операцию в леджере (TR-16).
+-- Финальный статус закрывает задачи, которые больше не нужны
+CREATE FUNCTION transfers.enqueue_task() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE k text;
+BEGIN
+    IF NEW.status = OLD.status THEN RETURN NEW; END IF;
+    k := CASE
+        WHEN OLD.status = 'NEW' AND NEW.status = 'HELD' THEN 'ANTIFRAUD_CHECK'
+        WHEN NEW.status = 'POSTING' THEN 'POST'
+        WHEN OLD.status = 'NEW' AND NEW.status = 'REJECTED' THEN NULL   -- холда не было: лимит, остаток, счёт
+        WHEN NEW.status IN ('REJECTED', 'CANCELLED', 'FAILED') THEN 'RELEASE_HOLD'
+    END;
+    IF transfers.is_final(NEW.status) THEN
+        UPDATE transfers.task SET done_at = clock_timestamp(), outcome = 'NOT_NEEDED'
+         WHERE transfer_id = NEW.id AND done_at IS NULL;
+    END IF;
+    IF k IS NOT NULL THEN
+        INSERT INTO transfers.task (transfer_id, kind) VALUES (NEW.id, k);
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER transfer_enqueue_task AFTER UPDATE OF status ON transfers.transfer
+    FOR EACH ROW EXECUTE FUNCTION transfers.enqueue_task();
+
+-- Повтор задачи (P-17): пауза растёт вдвое от 1 с до потолка, со случайным разбросом ± 50%.
+-- Потолок — 5 мин для проверки антифродом (P-10), 1 мин для операций леджера
+CREATE FUNCTION transfers.retry_task(p_id bigint, p_error text, p_cap interval) RETURNS timestamptz
+LANGUAGE sql AS $$
+    UPDATE transfers.task
+       SET attempts = attempts + 1, last_error = p_error,
+           due_at = clock_timestamp()
+                    + least(p_cap, interval '1 second' * power(2, least(attempts, 20))) * (0.5 + random())
+     WHERE id = p_id AND done_at IS NULL
+    RETURNING due_at
+$$;
+
+-- Что требует внимания регламентной проверки (TR-30). P-12 = 5 мин
+CREATE VIEW transfers.attention AS
+SELECT t.id AS transfer_id, t.status, 'NEW_TOO_LONG' AS reason      -- закрыть: FAILED и снятие холда
+  FROM transfers.transfer t
+ WHERE t.status = 'NEW' AND t.created_at < clock_timestamp() - interval '5 minutes'
+UNION ALL
+SELECT t.id, t.status, 'NO_OPEN_TASK'                                -- инцидент: восстановить задачу
+  FROM transfers.transfer t
+ WHERE t.status IN ('HELD', 'CHECKING', 'POSTING')
+   AND NOT EXISTS (SELECT 1 FROM transfers.task k WHERE k.transfer_id = t.id AND k.done_at IS NULL)
+UNION ALL
+SELECT k.transfer_id, t.status, 'TASK_OVERDUE'                       -- алерт: лежит зависимость
+  FROM transfers.task k JOIN transfers.transfer t ON t.id = k.transfer_id
+ WHERE k.done_at IS NULL AND k.created_at < clock_timestamp() - interval '5 minutes';
+
 -- Попытки проверки антифродом и решения по ручной проверке
 CREATE TABLE transfers.antifraud_check (
     transfer_id  uuid NOT NULL REFERENCES transfers.transfer (id),
