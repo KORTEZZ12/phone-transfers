@@ -1,0 +1,63 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Контракты OpenAPI и AsyncAPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: OpenAPI, redocly lint
+        run: npx -y @redocly/cli@2.72.1 lint docs/api/openapi.yaml
+      - name: AsyncAPI, официальный парсер
+        run: |
+          npm install --no-save --no-package-lock @asyncapi/parser@3.6.6
+          node scripts/validate-asyncapi.mjs docs/api/asyncapi.yaml
+
+  database:
+    name: Модель данных на PostgreSQL 16
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      DB: pt_check
+    steps:
+      - uses: actions/checkout@v4
+      - name: DDL и проверки правил
+        working-directory: docs/design
+        run: |
+          createdb pt_check
+          psql -X -v ON_ERROR_STOP=1 -d pt_check -f ddl.sql -f ddl-checks.sql
+      - name: Гонка за лимит
+        working-directory: docs/design
+        run: ./concurrency-check.sh
+
+  docs:
+    name: Ссылки в документации
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check-links.py
