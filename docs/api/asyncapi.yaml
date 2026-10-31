@@ -185,15 +185,15 @@ components:
           description: Растёт на 1 с каждым изменением перевода, по ней потребитель отбрасывает устаревшие события
         status:
           type: string
-          enum: [PROCESSING, ON_REVIEW, COMPLETED, REJECTED, CANCELLED, FAILED]
+          enum: [PROCESSING, ON_REVIEW, AWAITING_CONFIRMATION, DELAYED, COMPLETED, REJECTED, CANCELLED, FAILED]
         previousStatus:
           type: [string, 'null']
-          enum: [PROCESSING, ON_REVIEW, COMPLETED, REJECTED, CANCELLED, FAILED, null]
+          enum: [PROCESSING, ON_REVIEW, AWAITING_CONFIRMATION, DELAYED, COMPLETED, REJECTED, CANCELLED, FAILED, null]
         isFinal:
           type: boolean
         rejectReason:
           type: [string, 'null']
-          enum: [INSUFFICIENT_FUNDS, FRAUD_SUSPECTED, REVIEW_EXPIRED, RECIPIENT_ACCOUNT_UNAVAILABLE, null]
+          enum: [INSUFFICIENT_FUNDS, FRAUD_SUSPECTED, REVIEW_EXPIRED, RECIPIENT_ACCOUNT_UNAVAILABLE, NOT_CONFIRMED, null]
         amount:
           type: object
           required: [value, currency]
