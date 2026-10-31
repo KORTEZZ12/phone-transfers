@@ -179,6 +179,21 @@ DO $$ BEGIN
   END;
 END $$;
 
+-- TR-34: пока действует аренда, повтор не берёт перевод в работу; после окончания — берёт
+DO $$ BEGIN
+  INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, lease_until)
+  VALUES ('40000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001',
+          '50000000-0000-0000-0000-000000000004', 'h4', '20000000-0000-0000-0000-000000000002',
+          '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
+          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW', clock_timestamp() + interval '30 seconds');
+  ASSERT NOT transfers.take_lease('40000000-0000-0000-0000-000000000004', interval '30 seconds'), 'аренда занята первым запросом';
+  UPDATE transfers.transfer SET lease_until = clock_timestamp() - interval '1 second' WHERE id = '40000000-0000-0000-0000-000000000004';
+  ASSERT transfers.take_lease('40000000-0000-0000-0000-000000000004', interval '30 seconds'), 'истёкшую аренду должен взять повтор';
+  ASSERT NOT transfers.take_lease('40000000-0000-0000-0000-000000000004', interval '30 seconds'), 'второй повтор аренду не получает';
+  RAISE NOTICE 'ok  TR-34 повтор продолжает обработку только после окончания аренды первого запроса';
+END $$;
+
 -- Статусная модель: из финального статуса переходов нет
 DO $$ BEGIN
   BEGIN

@@ -27,7 +27,7 @@
 | Холд | ALREADY_CAPTURED | статус не меняется; если перевод в NEW — инцидент, такого сочетания быть не может | — |
 | Холд | INSUFFICIENT_FUNDS | NEW → REJECTED | 422 INSUFFICIENT_FUNDS |
 | Холд | ACCOUNT_UNAVAILABLE, CURRENCY_MISMATCH | NEW → REJECTED, причина SOURCE_ACCOUNT_UNAVAILABLE | 422 SOURCE_ACCOUNT_UNAVAILABLE |
-| Холд | таймаут после повторов | остаётся NEW | 503, повтор с тем же ключом продолжит обработку |
+| Холд | таймаут после повторов | остаётся NEW | 503, повтор с тем же ключом после окончания аренды P-14 продолжит обработку |
 | Проводка | POSTED, ALREADY_POSTED | POSTING → COMPLETED | пуш «Выполнен» |
 | Проводка | RECIPIENT_ACCOUNT_UNAVAILABLE, SOURCE_ACCOUNT_UNAVAILABLE | POSTING → REJECTED с той же причиной, холд снимается | пуш «Отклонён» |
 | Проводка | HOLD_RELEASED, NO_HOLD | POSTING → FAILED и инцидент: холда нет, проводить нельзя, деньги не заблокированы | пуш «Не выполнен» |
