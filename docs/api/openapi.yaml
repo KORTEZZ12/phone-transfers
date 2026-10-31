@@ -3,9 +3,14 @@ info:
   title: Переводы по номеру телефона
   version: 1.0.0
   description: |
-    API мобильного приложения для переводов между клиентами банка по номеру телефона
-    и внутренний колбэк антифрода. Соглашения — в [README](README.md):
-    аутентификация, ключ идемпотентности, формат сумм, каталог ошибок.
+    API мобильного приложения для переводов между клиентами банка по номеру телефона.
+    Соглашения — в [README](README.md): аутентификация, ключ идемпотентности, формат сумм,
+    каталог ошибок. Внутренний колбэк антифрода — отдельная спецификация
+    `internal-antifraud.yaml` для внутреннего контура.
+
+    Серверные сбои и недоступность зависимых систем во всех операциях выглядят одинаково:
+    503 `SERVICE_UNAVAILABLE` с `Retry-After`. Приложение повторяет запрос с тем же ключом
+    по правилам TR-10, поэтому в операциях 503 отдельно не описан.
 
     Отправитель всегда определяется по токену доступа, а не по телу запроса.
     Банк вымышленный, домен `bank.example` зарезервирован для примеров.
@@ -24,8 +29,6 @@ tags:
     description: Создание, статус и отмена перевода
   - name: Лимиты
     description: Сколько ещё можно перевести
-  - name: Внутренние
-    description: Вызовы от систем банка, не из приложения
 security:
   - bearerAuth: []
 paths:
@@ -93,8 +96,6 @@ paths:
                 traceId: 4bf92f3577b34da6a3ce929d0e0e4736
         '429':
           $ref: '#/components/responses/LookupRateLimited'
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
   /v1/transfers:
     post:
       tags: [Переводы]
@@ -271,6 +272,24 @@ paths:
                     code: RECIPIENT_TOKEN_EXPIRED
                     detail: С момента поиска прошло больше 10 минут.
                     traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                currency:
+                  summary: У получателя нет счёта в этой валюте
+                  value:
+                    type: https://api.bank.example/problems/recipient-currency-unavailable
+                    title: Получатель не принимает эту валюту
+                    status: 422
+                    code: RECIPIENT_CURRENCY_UNAVAILABLE
+                    detail: У получателя нет основного счёта в долларах. Доступно — рубли.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                sourceAccount:
+                  summary: Счёт списания заблокирован или закрыт
+                  value:
+                    type: https://api.bank.example/problems/source-account-unavailable
+                    title: С этого счёта сейчас нельзя переводить
+                    status: 422
+                    code: SOURCE_ACCOUNT_UNAVAILABLE
+                    detail: Счёт заблокирован или закрыт. Выберите другой счёт.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
                 keyReused:
                   summary: Ключ уже использован для другого перевода
                   value:
@@ -281,8 +300,6 @@ paths:
                     detail: Перевод с этим ключом уже создан с другими данными. Откройте его, повторно не отправляйте.
                     existingTransferId: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
                     traceId: 4bf92f3577b34da6a3ce929d0e0e4736
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
   /v1/transfers/{transferId}:
     get:
       tags: [Переводы]
@@ -475,56 +492,6 @@ paths:
                   resetsAt: '2026-11-01T00:00:00+03:00'
         '401':
           $ref: '#/components/responses/Unauthorized'
-  /internal/v1/antifraud/decisions:
-    post:
-      tags: [Внутренние]
-      operationId: receiveAntifraudDecision
-      summary: Решение антифрода по ручной проверке
-      description: |
-        Вызывает антифрод, когда сотрудник принял решение. Идемпотентно по `decisionId`.
-        Решение SUSPEND приостанавливает перевод до подтверждения клиентом (TR-35).
-        Если перевод ещё в CHECKING, решение сохраняется и применяется при переходе в REVIEW.
-        Если перевод уже в финальном статусе (отменён отправителем или истёк срок проверки),
-        ответ — 200 с `applied: false` и текущим статусом: антифроду нечего исправлять,
-        ему нужно только закрыть кейс. Ошибка 4xx тут бесполезна, на неё нельзя отреагировать.
-      security:
-        - antifraudMtls: []
-      parameters:
-        - $ref: '#/components/parameters/Traceparent'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/AntifraudDecision'
-            example:
-              decisionId: 9c8b7a6f-5e4d-4c3b-8a2f-1e0d9c8b7a6f
-              transferId: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
-              decision: ALLOW
-              decidedAt: '2026-10-19T12:20:40+03:00'
-              reasonCode: null
-      responses:
-        '200':
-          description: Решение принято к сведению
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AntifraudDecisionResult'
-              examples:
-                applied:
-                  summary: Решение применено
-                  value:
-                    applied: true
-                    transferStatus: PROCESSING
-                tooLate:
-                  summary: Перевод уже отменён отправителем
-                  value:
-                    applied: false
-                    transferStatus: CANCELLED
-        '400':
-          $ref: '#/components/responses/ValidationError'
-        '404':
-          $ref: '#/components/responses/TransferNotFound'
 components:
   securitySchemes:
     bearerAuth:
@@ -532,9 +499,6 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: Токен приложения. Отправитель берётся из токена.
-    antifraudMtls:
-      type: mutualTLS
-      description: Взаимный TLS, сертификат системы антифрода из доверенного списка
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -649,23 +613,6 @@ components:
             detail: Попробуйте через 2 минуты.
             retryAfterSeconds: 120
             traceId: 4bf92f3577b34da6a3ce929d0e0e4736
-    ServiceUnavailable:
-      description: Зависимая система недоступна. Повторить с тем же ключом
-      headers:
-        Retry-After:
-          $ref: '#/components/headers/RetryAfter'
-      content:
-        application/problem+json:
-          schema:
-            $ref: '#/components/schemas/Problem'
-          example:
-            type: https://api.bank.example/problems/service-unavailable
-            title: Сервис временно недоступен
-            status: 503
-            code: SERVICE_UNAVAILABLE
-            detail: Повторите запрос через несколько секунд.
-            retryAfterSeconds: 5
-            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
   schemas:
     Money:
       type: object
@@ -737,12 +684,15 @@ components:
       enum: [PROCESSING, ON_REVIEW, AWAITING_CONFIRMATION, DELAYED, COMPLETED, REJECTED, CANCELLED, FAILED]
     RejectReason:
       type: string
+      description: |
+        Причина асинхронного отказа. Отказы до блокировки средств — лимит, остаток, счёт —
+        приходят синхронно ответом 422 и в ресурсе перевода не встречаются (соглашения API).
       enum:
-        - INSUFFICIENT_FUNDS
         - FRAUD_SUSPECTED
         - REVIEW_EXPIRED
-        - RECIPIENT_ACCOUNT_UNAVAILABLE
         - NOT_CONFIRMED
+        - RECIPIENT_ACCOUNT_UNAVAILABLE
+        - SOURCE_ACCOUNT_UNAVAILABLE
     Transfer:
       type: object
       required: [id, status, amount, recipient, sourceAccountId, cancellable, createdAt, updatedAt]
@@ -816,33 +766,6 @@ components:
           $ref: '#/components/schemas/LimitPeriod'
         month:
           $ref: '#/components/schemas/LimitPeriod'
-    AntifraudDecision:
-      type: object
-      required: [decisionId, transferId, decision, decidedAt]
-      properties:
-        decisionId:
-          type: string
-          format: uuid
-        transferId:
-          type: string
-          format: uuid
-        decision:
-          type: string
-          enum: [ALLOW, DENY, SUSPEND]
-        decidedAt:
-          type: string
-          format: date-time
-        reasonCode:
-          type: [string, 'null']
-    AntifraudDecisionResult:
-      type: object
-      required: [applied, transferStatus]
-      properties:
-        applied:
-          type: boolean
-          description: false — перевод уже был в финальном статусе
-        transferStatus:
-          $ref: '#/components/schemas/TransferStatus'
     Problem:
       type: object
       description: RFC 9457 Problem Details плюс машиночитаемый код

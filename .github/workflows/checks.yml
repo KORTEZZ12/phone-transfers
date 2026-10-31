@@ -18,7 +18,7 @@ jobs:
         with:
           node-version: 22
       - name: OpenAPI, redocly lint
-        run: npx -y @redocly/cli@2.72.1 lint docs/api/openapi.yaml
+        run: npx -y @redocly/cli@2.72.1 lint docs/api/openapi.yaml docs/api/internal-antifraud.yaml
       - name: AsyncAPI, официальный парсер
         run: |
           npm install --no-save --no-package-lock @asyncapi/parser@3.6.6

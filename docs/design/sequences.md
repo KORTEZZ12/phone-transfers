@@ -85,21 +85,25 @@ sequenceDiagram
 
 ## SD-3. Гонка за лимит
 
-Проверено на PostgreSQL двумя параллельными сессиями: [`concurrency-check.sh`](concurrency-check.sh).
+Резерв лимита атомарен: проверка остатка лимита и резерв — одна операция, параллельные резервы одного отправителя выполняются по очереди. Проверено на PostgreSQL двумя параллельными сессиями: [`concurrency-check.sh`](concurrency-check.sh).
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant A as Запрос A, 5 000 ₽
-  participant B as Запрос B, 5 000 ₽
+  participant A as Приложение, запрос A на 5 000 ₽
+  participant B as Приложение, запрос B на 5 000 ₽
+  participant TS as Сервис переводов
   participant DB as База переводов
   Note over DB: до дневного лимита осталось 8 500 ₽
-  A->>DB: резерв лимита, блокирует строки DAY и MONTH
-  B->>DB: резерв лимита, ждёт блокировку
-  DB-->>A: OK, зарезервировано 5 000 ₽
-  A->>DB: COMMIT
-  DB-->>B: DAY, вместе с A получается больше лимита
-  B-->>B: 422 LIMIT_EXCEEDED, доступно 3 500 ₽
+  A->>TS: POST /v1/transfers
+  B->>TS: POST /v1/transfers
+  TS->>DB: проверить и зарезервировать лимит A атомарно
+  TS->>DB: проверить и зарезервировать лимит B атомарно
+  Note over DB: резервы одного отправителя идут по очереди, B ждёт, пока закончится A
+  DB-->>TS: A: зарезервировано 5 000 ₽
+  TS-->>A: 201 PROCESSING
+  DB-->>TS: B: вместе с A превышен дневной лимит
+  TS-->>B: 422 LIMIT_EXCEEDED, доступно 3 500 ₽
 ```
 
 ## SD-4. Антифрод, ручная проверка, отмена

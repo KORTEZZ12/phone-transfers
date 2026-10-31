@@ -229,7 +229,8 @@ components:
           type: boolean
         rejectReason:
           type: [string, 'null']
-          enum: [INSUFFICIENT_FUNDS, FRAUD_SUSPECTED, REVIEW_EXPIRED, RECIPIENT_ACCOUNT_UNAVAILABLE, NOT_CONFIRMED, null]
+          description: Только асинхронные отказы. Отказ до блокировки средств событий не даёт (TR-27)
+          enum: [FRAUD_SUSPECTED, REVIEW_EXPIRED, NOT_CONFIRMED, RECIPIENT_ACCOUNT_UNAVAILABLE, SOURCE_ACCOUNT_UNAVAILABLE, null]
         amount:
           type: object
           required: [value, currency]
