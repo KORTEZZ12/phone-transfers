@@ -28,6 +28,22 @@ CREATE TABLE ledger.account (
 CREATE UNIQUE INDEX account_one_primary_per_currency
     ON ledger.account (client_id, currency) WHERE is_primary AND status <> 'CLOSED';
 
+-- Баланс — проекция проводок: счёт открывается с нулевым балансом, меняет баланс только
+-- триггер apply_posting. Прямой UPDATE баланса из сервиса или руками — ошибка
+CREATE FUNCTION ledger.guard_balance() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' AND NEW.balance <> 0 THEN
+        RAISE EXCEPTION 'Счёт открывается с нулевым балансом, деньги приходят только проводкой';
+    END IF;
+    -- глубина 1 — изменение пришло снаружи, глубина 2 — из apply_posting
+    IF TG_OP = 'UPDATE' AND NEW.balance IS DISTINCT FROM OLD.balance AND pg_trigger_depth() < 2 THEN
+        RAISE EXCEPTION 'Баланс меняется только проводкой: это проекция суммы проводок';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER account_guard_balance BEFORE INSERT OR UPDATE ON ledger.account
+    FOR EACH ROW EXECUTE FUNCTION ledger.guard_balance();
+
 CREATE TABLE ledger.hold (
     id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     transfer_id  uuid NOT NULL UNIQUE,                  -- TR-16: один холд на перевод
@@ -41,6 +57,19 @@ CREATE TABLE ledger.hold (
     FOREIGN KEY (account_id, currency) REFERENCES ledger.account (id, currency)
 );
 CREATE INDEX hold_active_by_account ON ledger.hold (account_id) WHERE status = 'ACTIVE';
+
+-- Закрытые операции (TR-16): холд по transferId сняли раньше, чем он появился.
+-- Запоздавший холд по такому transferId не создаётся, а возвращает ALREADY_RELEASED
+CREATE TABLE ledger.closed_operation (
+    transfer_id  uuid PRIMARY KEY,
+    closed_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Операции леджера по одному transferId выполняются по очереди: холд, снятие и проводка
+-- по одному переводу не обгоняют друг друга
+CREATE FUNCTION ledger.lock_operation(p_transfer_id uuid) RETURNS void LANGUAGE sql AS $$
+    SELECT pg_advisory_xact_lock(hashtextextended(p_transfer_id::text, 0))
+$$;
 
 -- Проводка — одна строка «дебет — кредит — сумма»: равенство дебета и кредита выполнено по построению
 CREATE TABLE ledger.posting (
@@ -90,12 +119,15 @@ CREATE TRIGGER posting_check_reversal BEFORE INSERT ON ledger.posting
     FOR EACH ROW EXECUTE FUNCTION ledger.check_reversal();
 
 -- Баланс меняется в той же транзакции, что и проводка. Счета блокируются в порядке id,
--- чтобы встречные переводы A→B и B→A не дали взаимоблокировку
+-- чтобы встречные переводы A→B и B→A не дали взаимоблокировку.
+-- Именно FOR NO KEY UPDATE, а не FOR UPDATE: внешние ключи проводки уже взяли на эти счета
+-- FOR KEY SHARE, и FOR UPDATE с ней конфликтует — две проводки с общим счётом ждали бы
+-- друг друга. Проверка — ledger-concurrency-check.sh
 CREATE FUNCTION ledger.apply_posting() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM 1 FROM ledger.account
      WHERE id IN (NEW.debit_account_id, NEW.credit_account_id)
-     ORDER BY id FOR UPDATE;
+     ORDER BY id FOR NO KEY UPDATE;
     UPDATE ledger.account SET balance = balance - NEW.amount WHERE id = NEW.debit_account_id;
     UPDATE ledger.account SET balance = balance + NEW.amount WHERE id = NEW.credit_account_id;
     RETURN NEW;
@@ -118,8 +150,13 @@ DECLARE
     existing ledger.hold%ROWTYPE;
     held numeric;
 BEGIN
+    PERFORM ledger.lock_operation(p_transfer_id);
+    -- холд по закрытой операции не создаётся: её уже сняли (TR-16)
+    IF EXISTS (SELECT 1 FROM ledger.closed_operation WHERE transfer_id = p_transfer_id) THEN
+        RETURN 'ALREADY_RELEASED';
+    END IF;
     -- блокировка счёта сериализует холды по нему: два перевода не потратят один остаток
-    SELECT * INTO acc FROM ledger.account WHERE id = p_account_id FOR UPDATE;
+    SELECT * INTO acc FROM ledger.account WHERE id = p_account_id FOR NO KEY UPDATE;
     SELECT * INTO existing FROM ledger.hold WHERE transfer_id = p_transfer_id;
     IF FOUND THEN
         IF existing.account_id <> p_account_id OR existing.amount <> p_amount OR existing.currency <> p_currency THEN
@@ -136,15 +173,19 @@ BEGIN
     RETURN 'HELD';
 END $$;
 
--- Операция «снять холд». Идемпотентна
+-- Операция «снять холд». Идемпотентна. Если холда ещё нет, закрывает transferId:
+-- запоздавший холд по нему уже не появится (TR-16)
 CREATE FUNCTION ledger.release_hold(p_transfer_id uuid) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE st text;
 BEGIN
+    PERFORM ledger.lock_operation(p_transfer_id);
     UPDATE ledger.hold SET status = 'RELEASED', closed_at = now()
      WHERE transfer_id = p_transfer_id AND status = 'ACTIVE';
     IF FOUND THEN RETURN 'RELEASED'; END IF;
     SELECT status INTO st FROM ledger.hold WHERE transfer_id = p_transfer_id;
-    RETURN COALESCE('ALREADY_' || st, 'NO_HOLD');
+    IF FOUND THEN RETURN 'ALREADY_' || st; END IF;
+    INSERT INTO ledger.closed_operation (transfer_id) VALUES (p_transfer_id) ON CONFLICT DO NOTHING;
+    RETURN 'NO_HOLD';
 END $$;
 
 -- Операция «провести перевод»: списать холд и зачислить получателю одной транзакцией (TR-14)
@@ -152,12 +193,21 @@ CREATE FUNCTION ledger.post_transfer(p_transfer_id uuid, p_credit_account_id uui
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
     h ledger.hold%ROWTYPE;
+    dr ledger.account%ROWTYPE;
     cr ledger.account%ROWTYPE;
 BEGIN
+    PERFORM ledger.lock_operation(p_transfer_id);
     SELECT * INTO h FROM ledger.hold WHERE transfer_id = p_transfer_id FOR UPDATE;
     IF NOT FOUND THEN RETURN 'NO_HOLD'; END IF;
     IF h.status = 'CAPTURED' THEN RETURN 'ALREADY_POSTED'; END IF;
     IF h.status = 'RELEASED' THEN RETURN 'HOLD_RELEASED'; END IF;
+    -- оба счёта блокируются до проверок, в порядке id: статус не изменится между проверкой и проводкой
+    PERFORM 1 FROM ledger.account WHERE id IN (h.account_id, p_credit_account_id)
+     ORDER BY id FOR NO KEY UPDATE;
+    SELECT * INTO dr FROM ledger.account WHERE id = h.account_id;
+    IF dr.status <> 'OPEN' THEN
+        RETURN 'SOURCE_ACCOUNT_UNAVAILABLE';             -- счёт отправителя заблокировали после холда (TR-18)
+    END IF;
     SELECT * INTO cr FROM ledger.account WHERE id = p_credit_account_id;
     IF NOT FOUND OR cr.status <> 'OPEN' OR cr.currency <> h.currency THEN
         RETURN 'RECIPIENT_ACCOUNT_UNAVAILABLE';          -- сервис переводов отклонит перевод (TR-18)
