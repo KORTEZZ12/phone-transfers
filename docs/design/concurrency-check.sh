@@ -6,15 +6,16 @@ set -euo pipefail
 DB="${DB:-pt_check}"
 SENDER="10000000-0000-0000-0000-000000000001"
 SQL="SELECT transfers.reserve_limit('$SENDER', DATE '2026-10-19', 5000, 300000, 500000, 2000000)"
+OUT=$(mktemp)
 
-psql -X -q -t -A -d "$DB" -c "BEGIN; $SQL; SELECT pg_sleep(2); COMMIT;" > /tmp/session_a.txt &
+psql -X -q -t -A -d "$DB" -c "BEGIN; $SQL; SELECT pg_sleep(2); COMMIT;" > "$OUT" &
 sleep 0.5
-B_START=$(date +%s.%N)
+B_START=$(date +%s%N)
 B=$(psql -X -q -t -A -d "$DB" -c "$SQL")
-B_WAIT=$(echo "$(date +%s.%N) - $B_START" | bc)
+B_WAIT_MS=$(( ($(date +%s%N) - B_START) / 1000000 ))
 wait
-A=$(head -1 /tmp/session_a.txt)
+A=$(head -1 "$OUT")
 
 echo "Сессия A: $A"
-echo "Сессия B: $B (ждала блокировку ${B_WAIT%.*} с)"
+echo "Сессия B: $B (ждала блокировку ${B_WAIT_MS} мс)"
 [ "$A" = "OK" ] && [ "$B" = "DAY" ] && echo "ok  параллельные переводы вместе не превысили лимит" || { echo "FAIL"; exit 1; }
