@@ -304,6 +304,9 @@ DO $$ BEGIN
   ASSERT (SELECT array_agg(payload->>'status' ORDER BY transfer_version) FROM transfers.outbox_event
            WHERE transfer_id = '40000000-0000-0000-0000-000000000006')
          = ARRAY['PROCESSING', 'AWAITING_CONFIRMATION', 'PROCESSING', 'DELAYED', 'PROCESSING', 'COMPLETED'];
+  ASSERT (SELECT array_agg(transfer_version ORDER BY seq) = array_agg(transfer_version ORDER BY transfer_version)
+            FROM transfers.outbox_event WHERE transfer_id = '40000000-0000-0000-0000-000000000006'),
+         'порядок выборки relay совпадает с порядком версий';
   RAISE NOTICE 'ok  TR-35…TR-37 приостановка, подтверждение, отложенное исполнение и события для клиента';
 END $$;
 

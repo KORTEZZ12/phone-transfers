@@ -1,18 +1,22 @@
 asyncapi: 3.1.0
 info:
   title: События переводов
-  version: 1.0.0
+  version: 1.1.0
   description: |
-    Сервис переводов публикует каждое изменение статуса перевода (TR-27).
+    Сервис переводов публикует событие при блокировке средств и при каждой смене статуса,
+    который видит клиент (TR-27). Внутренние шаги, например HELD → CHECKING, событий не дают.
     События попадают в Kafka через outbox: статус и событие пишутся в одной транзакции,
-    отдельный процесс переносит события в топик (ADR-003).
+    отдельный процесс переносит события в топик в порядке записи (ADR-003).
 
     Гарантия доставки — «хотя бы один раз». Поэтому каждый потребитель обязан:
     1. Пропускать событие, `eventId` которого уже обработан.
     2. Применять событие, только если `transferVersion` больше сохранённой у потребителя.
-       Финальный статус событием с меньшей версией не откатывается (TR-29).
-    3. Не блокировать партицию: после трёх неудачных попыток событие уходит в свой топик
-       повторов, после исчерпания повторов — в DLQ с алертом.
+       Версия растёт монотонно, но в потоке идёт с пропусками: она меняется при каждом
+       изменении перевода, а событие есть не у каждого. Пропуск номера — норма, а не потерянное
+       событие. Финальный статус событием с меньшей версией не откатывается (TR-29).
+    3. Не блокировать партицию: после трёх неудачных попыток событие уходит в топик повтора
+       с паузой 1 мин, затем 5 и 15 мин, после исчерпания — в DLQ с алертом. У каждой паузы
+       свой топик: событие с паузой 15 мин не задерживает события с паузой 1 мин.
 
     В событиях нет номеров телефонов и счетов, только идентификаторы клиентов.
   contact:
@@ -42,17 +46,28 @@ channels:
           cleanup.policy: [delete]
           retention.ms: 1209600000
         bindingVersion: 0.5.0
-  notificationsRetry:
-    address: transfers.events.v1.notifications.retry
-    title: Повторы для уведомлений
-    description: Событие, которое сервис уведомлений не обработал за три попытки. Повтор через 1, 5 и 15 мин
+  consumerRetry:
+    address: 'transfers.events.v1.{consumer}.retry.{delay}'
+    title: Повтор у потребителя
+    description: |
+      Событие, которое потребитель не обработал за три попытки. Отдельный топик на каждую паузу:
+      1m, 5m, 15m. Потребитель читает топик паузы и обрабатывает событие не раньше,
+      чем через эту паузу после попадания в топик.
+    parameters:
+      consumer:
+        $ref: '#/components/parameters/consumer'
+      delay:
+        $ref: '#/components/parameters/delay'
     messages:
       transferStatusChanged:
         $ref: '#/components/messages/TransferStatusChanged'
-  notificationsDlq:
-    address: transfers.events.v1.notifications.dlq
-    title: DLQ уведомлений
-    description: События, которые не удалось обработать после всех повторов. Каждое попадание — алерт
+  consumerDlq:
+    address: 'transfers.events.v1.{consumer}.dlq'
+    title: DLQ потребителя
+    description: События, которые не удалось обработать после всех повторов. Каждое попадание — алерт, разбор — по runbook
+    parameters:
+      consumer:
+        $ref: '#/components/parameters/consumer'
     messages:
       transferStatusChanged:
         $ref: '#/components/messages/TransferStatusChanged'
@@ -69,10 +84,13 @@ operations:
     action: receive
     channel:
       $ref: '#/channels/transferEvents'
-    title: Пуш отправителю и получателю
+    title: Пуши отправителю и получателю
     summary: |
-      Сервис уведомлений. Пуш только на финальные статусы и на ON_REVIEW.
-      Дедупликация по eventId, иначе клиент получит два пуша.
+      Сервис уведомлений, пуши по матрице «статус × адресат» (TR-28): получателю — только COMPLETED,
+      отправителю — ON_REVIEW, AWAITING_CONFIRMATION, DELAYED и финальные статусы. Причину
+      FRAUD_SUSPECTED отправитель видит без подробностей. Дедупликация по паре «eventId + адресат»:
+      при сбое на одном из двух пушей повтор не задублирует второй. У пуша collapse-key по
+      `transferId`, поэтому устройство показывает одно, последнее уведомление о переводе.
     bindings:
       kafka:
         groupId:
@@ -81,22 +99,6 @@ operations:
         bindingVersion: 0.5.0
     messages:
       - $ref: '#/channels/transferEvents/messages/transferStatusChanged'
-  retryNotification:
-    action: send
-    channel:
-      $ref: '#/channels/notificationsRetry'
-    title: Отложить событие для повтора
-    summary: Сервис уведомлений, после трёх неудачных попыток
-    messages:
-      - $ref: '#/channels/notificationsRetry/messages/transferStatusChanged'
-  parkNotification:
-    action: send
-    channel:
-      $ref: '#/channels/notificationsDlq'
-    title: Отправить событие в DLQ
-    summary: Сервис уведомлений, после исчерпания повторов
-    messages:
-      - $ref: '#/channels/notificationsDlq/messages/transferStatusChanged'
   buildHistory:
     action: receive
     channel:
@@ -111,7 +113,38 @@ operations:
         bindingVersion: 0.5.0
     messages:
       - $ref: '#/channels/transferEvents/messages/transferStatusChanged'
+  deferForRetry:
+    action: send
+    channel:
+      $ref: '#/channels/consumerRetry'
+    title: Отложить событие для повтора
+    summary: Любой потребитель, после трёх неудачных попыток или неудачного повтора
+    messages:
+      - $ref: '#/channels/consumerRetry/messages/transferStatusChanged'
+  consumeRetry:
+    action: receive
+    channel:
+      $ref: '#/channels/consumerRetry'
+    title: Обработать отложенное событие
+    summary: Тот же потребитель, после паузы своего топика; не получилось — следующая пауза или DLQ
+    messages:
+      - $ref: '#/channels/consumerRetry/messages/transferStatusChanged'
+  parkInDlq:
+    action: send
+    channel:
+      $ref: '#/channels/consumerDlq'
+    title: Отправить событие в DLQ
+    summary: Любой потребитель, после повтора с паузой 15 мин
+    messages:
+      - $ref: '#/channels/consumerDlq/messages/transferStatusChanged'
 components:
+  parameters:
+    consumer:
+      description: Группа потребителя
+      enum: [notifications, operations-history]
+    delay:
+      description: Пауза перед повтором
+      enum: [1m, 5m, 15m]
   messages:
     TransferStatusChanged:
       name: TransferStatusChanged
@@ -176,13 +209,16 @@ components:
         occurredAt:
           type: string
           format: date-time
+          description: Момент изменения статуса в сервисе переводов
         transferId:
           type: string
           format: uuid
         transferVersion:
           type: integer
           minimum: 1
-          description: Растёт на 1 с каждым изменением перевода, по ней потребитель отбрасывает устаревшие события
+          description: |
+            Растёт с каждым изменением перевода; в потоке событий номера идут с пропусками.
+            По ней потребитель отбрасывает устаревшие события, но не ищет «пропавшие»
         status:
           type: string
           enum: [PROCESSING, ON_REVIEW, AWAITING_CONFIRMATION, DELAYED, COMPLETED, REJECTED, CANCELLED, FAILED]
