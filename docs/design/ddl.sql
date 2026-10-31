@@ -226,6 +226,7 @@ CREATE TABLE transfers.recipient_token (
     token                uuid PRIMARY KEY,
     sender_client_id     uuid NOT NULL,                 -- токен действует только для того, кто искал (TR-02)
     recipient_client_id  uuid NOT NULL,
+    phone_hmac           text NOT NULL,                 -- HMAC номера: повтор поиска возвращает тот же токен (TR-03)
     display_name         text NOT NULL,
     accounts             jsonb NOT NULL,                -- основные счета получателя по валютам на момент поиска
     created_at           timestamptz NOT NULL DEFAULT now(),
@@ -233,6 +234,8 @@ CREATE TABLE transfers.recipient_token (
     CHECK (expires_at > created_at),
     CHECK (sender_client_id <> recipient_client_id)    -- TR-04
 );
+-- Повтор поиска того же номера, пока токен действует, находит этот токен и лимит не расходует (TR-03)
+CREATE INDEX recipient_token_by_phone ON transfers.recipient_token (sender_client_id, phone_hmac, expires_at);
 
 CREATE TABLE transfers.currency_rate (
     currency    char(3) NOT NULL CHECK (currency IN ('USD', 'EUR', 'CNY')),
@@ -253,7 +256,7 @@ CREATE TABLE transfers.transfer (
     source_account_id    uuid NOT NULL,
     target_account_id    uuid NOT NULL,
     currency             char(3) NOT NULL CHECK (currency IN ('RUB', 'USD', 'EUR', 'CNY')),
-    amount               numeric(19, 2) NOT NULL CHECK (amount > 0),
+    amount               numeric(19, 2) NOT NULL CHECK (amount >= 1),   -- TR-06: от 1 единицы валюты
     amount_rub           numeric(19, 2) NOT NULL CHECK (amount_rub > 0),  -- для лимитов (TR-25)
     rate_date            date,                          -- дата курса ЦБ, NULL для рублей
     limit_day            date NOT NULL,                 -- период лимита фиксируется при создании,
@@ -283,7 +286,9 @@ CREATE TABLE transfers.transfer (
     CHECK (status <> 'COOLING' OR (execute_after IS NOT NULL AND confirmed_at IS NOT NULL)),
     CHECK ((currency = 'RUB') = (rate_date IS NULL)),
     CHECK (currency <> 'RUB' OR amount_rub = amount),
-    CHECK (limit_month = date_trunc('month', limit_day)::date)
+    CHECK (limit_month = date_trunc('month', limit_day)::date),
+    CHECK (limit_day = (created_at AT TIME ZONE 'Europe/Moscow')::date),  -- TR-07: сутки по Москве
+    CHECK (sender_client_id <> recipient_client_id)                     -- TR-04: не себе
 );
 CREATE INDEX transfer_in_progress ON transfers.transfer (status, updated_at)
     WHERE status IN ('NEW', 'HELD', 'CHECKING', 'POSTING');  -- поиск зависших переводов (TR-30)

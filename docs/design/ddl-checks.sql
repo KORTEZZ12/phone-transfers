@@ -135,11 +135,11 @@ INSERT INTO transfers.limit_usage VALUES
 DO $$ BEGIN
   ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 1500, 300000, 500000, 2000000) = 'OK';
   INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
   VALUES ('40000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001',
           '50000000-0000-0000-0000-000000000001', 'h1', '20000000-0000-0000-0000-000000000002',
           '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
-          'RUB', 1500, 1500, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+          'RUB', 1500, 1500, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
   UPDATE transfers.transfer SET status = 'HELD'     WHERE id = '40000000-0000-0000-0000-000000000001';
   UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000001';
   UPDATE transfers.transfer SET status = 'POSTING'  WHERE id = '40000000-0000-0000-0000-000000000001';
@@ -157,11 +157,11 @@ DO $$ BEGIN
   ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 9000, 300000, 500000, 2000000) = 'DAY';
   ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 400000, 300000, 500000, 2000000) = 'OPERATION';
   INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, reject_reason)
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, reject_reason, created_at)
   VALUES ('40000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001',
           '50000000-0000-0000-0000-000000000002', 'h2', '20000000-0000-0000-0000-000000000002',
           '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
-          'RUB', 9000, 9000, DATE '2026-10-19', DATE '2026-10-01', 'REJECTED', 'LIMIT_EXCEEDED');
+          'RUB', 9000, 9000, DATE '2026-10-19', DATE '2026-10-01', 'REJECTED', 'LIMIT_EXCEEDED', TIMESTAMPTZ '2026-10-19 12:00+03');
   ASSERT NOT EXISTS (SELECT 1 FROM transfers.outbox_event WHERE transfer_id = '40000000-0000-0000-0000-000000000002');
   RAISE NOTICE 'ok  TR-08 лимит не превышается, отказ по лимиту без события';
 END $$;
@@ -170,10 +170,10 @@ END $$;
 DO $$ BEGIN
   BEGIN
     INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-           source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+           source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
     VALUES (gen_random_uuid(), '10000000-0000-0000-0000-000000000001', '50000000-0000-0000-0000-000000000001',
             'h-other', '20000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a1',
-            '00000000-0000-0000-0000-0000000000a2', 'RUB', 10, 10, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+            '00000000-0000-0000-0000-0000000000a2', 'RUB', 10, 10, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
     RAISE EXCEPTION 'второй перевод с тем же ключом создан';
   EXCEPTION WHEN unique_violation THEN RAISE NOTICE 'ok  TR-11 ключ идемпотентности уникален в пределах отправителя';
   END;
@@ -182,16 +182,51 @@ END $$;
 -- TR-34: пока действует аренда, повтор не берёт перевод в работу; после окончания — берёт
 DO $$ BEGIN
   INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, lease_until)
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, lease_until, created_at)
   VALUES ('40000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001',
           '50000000-0000-0000-0000-000000000004', 'h4', '20000000-0000-0000-0000-000000000002',
           '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
-          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW', clock_timestamp() + interval '30 seconds');
+          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW', clock_timestamp() + interval '30 seconds', TIMESTAMPTZ '2026-10-19 12:00+03');
   ASSERT NOT transfers.take_lease('40000000-0000-0000-0000-000000000004', interval '30 seconds'), 'аренда занята первым запросом';
   UPDATE transfers.transfer SET lease_until = clock_timestamp() - interval '1 second' WHERE id = '40000000-0000-0000-0000-000000000004';
   ASSERT transfers.take_lease('40000000-0000-0000-0000-000000000004', interval '30 seconds'), 'истёкшую аренду должен взять повтор';
   ASSERT NOT transfers.take_lease('40000000-0000-0000-0000-000000000004', interval '30 seconds'), 'второй повтор аренду не получает';
   RAISE NOTICE 'ok  TR-34 повтор продолжает обработку только после окончания аренды первого запроса';
+END $$;
+
+-- TR-04, TR-06, TR-07: не себе, от 1 единицы валюты, сутки лимита — по Москве
+DO $$
+DECLARE bad text[] := ARRAY[]::text[];
+BEGIN
+  BEGIN  -- перевод самому себе
+    INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+           source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
+    VALUES (gen_random_uuid(), '10000000-0000-0000-0000-000000000001', gen_random_uuid(), 'x', '10000000-0000-0000-0000-000000000001',
+            '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a1', 'RUB', 10, 10,
+            DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
+    bad := bad || 'себе';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN  -- 50 копеек
+    INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+           source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
+    VALUES (gen_random_uuid(), '10000000-0000-0000-0000-000000000001', gen_random_uuid(), 'x', '20000000-0000-0000-0000-000000000002',
+            '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2', 'RUB', 0.5, 0.5,
+            DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
+    bad := bad || 'меньше 1';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN  -- 23:30 по Москве 19-го — это ещё 19-е, а не 20-е по UTC+0
+    INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+           source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
+    VALUES (gen_random_uuid(), '10000000-0000-0000-0000-000000000001', gen_random_uuid(), 'x', '20000000-0000-0000-0000-000000000002',
+            '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2', 'RUB', 10, 10,
+            DATE '2026-10-20', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 23:30+03');
+    bad := bad || 'сутки не по Москве';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  ASSERT cardinality(bad) = 0, 'прошли запрещённые переводы: ' || array_to_string(bad, ', ');
+  RAISE NOTICE 'ok  TR-04, TR-06, TR-07 не себе, от 1 единицы, сутки лимита по Москве';
 END $$;
 
 -- Статусная модель: из финального статуса переходов нет
@@ -211,11 +246,11 @@ DO $$
 DECLARE n int;
 BEGIN
   INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
   VALUES ('40000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001',
           '50000000-0000-0000-0000-000000000003', 'h3', '20000000-0000-0000-0000-000000000002',
           '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
-          'RUB', 500, 500, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+          'RUB', 500, 500, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
   UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000003';
   UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000003';
   UPDATE transfers.transfer SET status = 'REVIEW', review_deadline = now() + interval '48 hours'
@@ -235,11 +270,11 @@ DECLARE due timestamptz;
 BEGIN
   ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 100, 300000, 500000, 2000000) = 'OK';
   INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
   VALUES ('40000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000001',
           '50000000-0000-0000-0000-000000000005', 'h5', '20000000-0000-0000-0000-000000000002',
           '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
-          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
   UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000005';
   ASSERT EXISTS (SELECT 1 FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000005'
                   AND kind = 'ANTIFRAUD_CHECK' AND done_at IS NULL), 'после холда должна стоять проверка антифродом';
@@ -275,11 +310,11 @@ END $$;
 DO $$ BEGIN
   ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 200, 300000, 500000, 2000000) = 'OK';
   INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
   VALUES ('40000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000001',
           '50000000-0000-0000-0000-000000000006', 'h6', '20000000-0000-0000-0000-000000000002',
           '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
-          'RUB', 200, 200, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+          'RUB', 200, 200, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
   UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000006';
   UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000006';
   UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = TIMESTAMPTZ '2026-10-20 23:59:59+03'
@@ -314,11 +349,11 @@ END $$;
 DO $$ BEGIN
   ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 300, 300000, 500000, 2000000) = 'OK';
   INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
-         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
   VALUES ('40000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000001',
           '50000000-0000-0000-0000-000000000007', 'h7', '20000000-0000-0000-0000-000000000002',
           '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
-          'RUB', 300, 300, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+          'RUB', 300, 300, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
   UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000007';
   UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000007';
   UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = TIMESTAMPTZ '2026-10-20 23:59:59+03'

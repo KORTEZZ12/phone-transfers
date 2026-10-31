@@ -37,7 +37,8 @@ paths:
       description: |
         POST, а не GET: номер телефона не должен попадать в URL и журналы доступа (TR-01).
         Возвращает токен получателя: перевод создаётся по нему, а не по номеру (TR-02).
-        Частота ограничена: P-02 в минуту и P-03 в сутки на отправителя (TR-03).
+        Частота ограничена: P-02 в минуту и P-03 в сутки на отправителя (TR-03). Повтор того же
+        номера, пока выданный токен действует, возвращает этот токен и лимит не расходует.
       parameters:
         - $ref: '#/components/parameters/Traceparent'
       requestBody:
@@ -65,7 +66,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          description: Клиента банка с таким номером нет
+          description: Клиента банка с таким номером нет, он заблокирован или у него нет открытого основного счёта — причина не раскрывается (TR-05)
           content:
             application/problem+json:
               schema:
@@ -592,7 +593,7 @@ components:
         title: Ошибка в данных
         status: 400
         code: VALIDATION_ERROR
-        detail: Сумма должна быть больше нуля и не больше двух знаков после запятой.
+        detail: Сумма — от 1 до лимита на операцию, не больше двух знаков после запятой.
         errors:
           - field: amount.value
             message: Неверный формат суммы
@@ -722,6 +723,7 @@ components:
           format: uuid
         amount:
           $ref: '#/components/schemas/Money'
+          description: От 1 единицы валюты до лимита на операцию, не больше двух знаков после запятой (TR-06)
         comment:
           type: [string, 'null']
           maxLength: 140
