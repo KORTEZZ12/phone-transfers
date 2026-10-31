@@ -260,14 +260,18 @@ CREATE TABLE transfers.transfer (
     limit_month          date NOT NULL,                 -- чтобы снятие резерва попало в тот же период
     comment              varchar(140),                  -- P-13
     status               text NOT NULL CHECK (status IN
-                             ('NEW', 'HELD', 'CHECKING', 'REVIEW', 'POSTING',
+                             ('NEW', 'HELD', 'CHECKING', 'REVIEW', 'SUSPENDED', 'COOLING', 'POSTING',
                               'COMPLETED', 'REJECTED', 'CANCELLED', 'FAILED')),
     reject_reason        text CHECK (reject_reason IN
                              ('LIMIT_EXCEEDED', 'INSUFFICIENT_FUNDS', 'SOURCE_ACCOUNT_UNAVAILABLE',
-                              'FRAUD_SUSPECTED', 'REVIEW_EXPIRED', 'RECIPIENT_ACCOUNT_UNAVAILABLE')),
+                              'FRAUD_SUSPECTED', 'REVIEW_EXPIRED', 'RECIPIENT_ACCOUNT_UNAVAILABLE',
+                              'NOT_CONFIRMED')),
     version              integer NOT NULL DEFAULT 1,    -- transferVersion в событиях
     review_deadline      timestamptz,
     lease_until          timestamptz,                   -- аренда обработки P-14 (TR-34)
+    confirmation_deadline timestamptz,                  -- 161-ФЗ: подтвердить до конца следующего дня, P-20 (TR-36)
+    confirmed_at         timestamptz,                   -- клиент подтвердил приостановленный перевод
+    execute_after        timestamptz,                   -- 161-ФЗ: отложенное исполнение, P-21 (TR-37)
     created_at           timestamptz NOT NULL DEFAULT now(),
     updated_at           timestamptz NOT NULL DEFAULT now(),
     completed_at         timestamptz,
@@ -275,6 +279,8 @@ CREATE TABLE transfers.transfer (
     CHECK ((status = 'REJECTED') = (reject_reason IS NOT NULL)),
     CHECK ((status = 'COMPLETED') = (completed_at IS NOT NULL)),
     CHECK (status <> 'REVIEW' OR review_deadline IS NOT NULL),
+    CHECK (status <> 'SUSPENDED' OR (confirmation_deadline IS NOT NULL AND confirmed_at IS NULL)),  -- подтверждённый не приостанавливается второй раз
+    CHECK (status <> 'COOLING' OR (execute_after IS NOT NULL AND confirmed_at IS NOT NULL)),
     CHECK ((currency = 'RUB') = (rate_date IS NULL)),
     CHECK (currency <> 'RUB' OR amount_rub = amount),
     CHECK (limit_month = date_trunc('month', limit_day)::date)
@@ -282,6 +288,7 @@ CREATE TABLE transfers.transfer (
 CREATE INDEX transfer_in_progress ON transfers.transfer (status, updated_at)
     WHERE status IN ('NEW', 'HELD', 'CHECKING', 'POSTING');  -- поиск зависших переводов (TR-30)
 CREATE INDEX transfer_review_deadline ON transfers.transfer (review_deadline) WHERE status = 'REVIEW';
+CREATE INDEX transfer_confirmation_deadline ON transfers.transfer (confirmation_deadline) WHERE status = 'SUSPENDED';
 
 -- Разрешённые переходы статусной модели (transfer-states.md)
 CREATE TABLE transfers.status_transition (
@@ -293,13 +300,18 @@ INSERT INTO transfers.status_transition VALUES
     ('NEW', 'HELD'), ('NEW', 'REJECTED'), ('NEW', 'FAILED'),
     ('HELD', 'CHECKING'),
     ('CHECKING', 'POSTING'), ('CHECKING', 'REJECTED'), ('CHECKING', 'REVIEW'),
-    ('REVIEW', 'POSTING'), ('REVIEW', 'REJECTED'), ('REVIEW', 'CANCELLED'),
+    ('CHECKING', 'SUSPENDED'), ('CHECKING', 'COOLING'),
+    ('REVIEW', 'POSTING'), ('REVIEW', 'REJECTED'), ('REVIEW', 'CANCELLED'), ('REVIEW', 'SUSPENDED'),
+    ('SUSPENDED', 'CHECKING'), ('SUSPENDED', 'REJECTED'), ('SUSPENDED', 'CANCELLED'),
+    ('COOLING', 'POSTING'), ('COOLING', 'CANCELLED'),
     ('POSTING', 'COMPLETED'), ('POSTING', 'REJECTED'), ('POSTING', 'FAILED');
 
 CREATE FUNCTION transfers.client_status(s text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
     SELECT CASE
         WHEN s IN ('NEW', 'HELD', 'CHECKING', 'POSTING') THEN 'PROCESSING'
         WHEN s = 'REVIEW' THEN 'ON_REVIEW'
+        WHEN s = 'SUSPENDED' THEN 'AWAITING_CONFIRMATION'
+        WHEN s = 'COOLING' THEN 'DELAYED'
         ELSE s END
 $$;
 
@@ -447,7 +459,7 @@ CREATE TRIGGER transfer_emit_event AFTER UPDATE OF status ON transfers.transfer
 CREATE TABLE transfers.task (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     transfer_id  uuid NOT NULL REFERENCES transfers.transfer (id),
-    kind         text NOT NULL CHECK (kind IN ('ANTIFRAUD_CHECK', 'POST', 'RELEASE_HOLD')),
+    kind         text NOT NULL CHECK (kind IN ('ANTIFRAUD_CHECK', 'CONFIRMATION_CHECK', 'RESUME', 'POST', 'RELEASE_HOLD')),
     due_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
     attempts     integer NOT NULL DEFAULT 0,
     last_error   text,
@@ -460,16 +472,21 @@ CREATE TABLE transfers.task (
 CREATE INDEX task_due ON transfers.task (due_at) WHERE done_at IS NULL;
 
 -- Следующий шаг ставится тем же переходом статуса:
---   NEW → HELD — проверка антифродом; → POSTING — проводка;
+--   NEW → HELD — проверка антифродом; подтверждение SUSPENDED → CHECKING — повторная сверка с базой ЦБ;
+--   → COOLING — возобновление в момент execute_after; → POSTING — проводка;
 --   отказ, отмена или сбой после холда, а также NEW → FAILED — снятие холда.
 -- NEW → FAILED снимает холд, которого может ещё не быть: снятие закрывает операцию в леджере (TR-16).
 -- Финальный статус закрывает задачи, которые больше не нужны
 CREATE FUNCTION transfers.enqueue_task() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE k text;
+DECLARE
+    k text;
+    due timestamptz := clock_timestamp();
 BEGIN
     IF NEW.status = OLD.status THEN RETURN NEW; END IF;
     k := CASE
         WHEN OLD.status = 'NEW' AND NEW.status = 'HELD' THEN 'ANTIFRAUD_CHECK'
+        WHEN OLD.status = 'SUSPENDED' AND NEW.status = 'CHECKING' THEN 'CONFIRMATION_CHECK'
+        WHEN NEW.status = 'COOLING' THEN 'RESUME'
         WHEN NEW.status = 'POSTING' THEN 'POST'
         WHEN OLD.status = 'NEW' AND NEW.status = 'REJECTED' THEN NULL   -- холда не было: лимит, остаток, счёт
         WHEN NEW.status IN ('REJECTED', 'CANCELLED', 'FAILED') THEN 'RELEASE_HOLD'
@@ -478,8 +495,9 @@ BEGIN
         UPDATE transfers.task SET done_at = clock_timestamp(), outcome = 'NOT_NEEDED'
          WHERE transfer_id = NEW.id AND done_at IS NULL;
     END IF;
+    IF k = 'RESUME' THEN due := NEW.execute_after; END IF;
     IF k IS NOT NULL THEN
-        INSERT INTO transfers.task (transfer_id, kind) VALUES (NEW.id, k);
+        INSERT INTO transfers.task (transfer_id, kind, due_at) VALUES (NEW.id, k, due);
     END IF;
     RETURN NEW;
 END $$;
@@ -509,16 +527,20 @@ SELECT t.id, t.status, 'NO_OPEN_TASK'                                -- инци
  WHERE t.status IN ('HELD', 'CHECKING', 'POSTING')
    AND NOT EXISTS (SELECT 1 FROM transfers.task k WHERE k.transfer_id = t.id AND k.done_at IS NULL)
 UNION ALL
-SELECT k.transfer_id, t.status, 'TASK_OVERDUE'                       -- алерт: лежит зависимость
+SELECT k.transfer_id, t.status, 'TASK_OVERDUE'                       -- алерт: лежит зависимость или исполнитель
   FROM transfers.task k JOIN transfers.transfer t ON t.id = k.transfer_id
- WHERE k.done_at IS NULL AND k.created_at < clock_timestamp() - interval '5 minutes';
+ WHERE k.done_at IS NULL
+   AND ((k.attempts > 0 AND k.created_at < clock_timestamp() - interval '5 minutes')   -- повторяется дольше P-12
+     OR k.due_at < clock_timestamp() - interval '5 minutes');                         -- срок прошёл, не взята
 
 -- Попытки проверки антифродом и решения по ручной проверке
 CREATE TABLE transfers.antifraud_check (
     transfer_id  uuid NOT NULL REFERENCES transfers.transfer (id),
     attempt      integer NOT NULL CHECK (attempt >= 1),
     sent_at      timestamptz NOT NULL DEFAULT now(),
-    outcome      text CHECK (outcome IN ('ALLOW', 'DENY', 'REVIEW', 'TIMEOUT', 'ERROR')),
+    stage        text NOT NULL DEFAULT 'INITIAL' CHECK (stage IN ('INITIAL', 'CONFIRMATION')),
+    outcome      text CHECK (outcome IN ('ALLOW', 'DENY', 'REVIEW', 'SUSPEND', 'DELAY', 'TIMEOUT', 'ERROR')),
+    case_id      text,                                  -- номер кейса ручной проверки у антифрода
     decision_id  uuid UNIQUE,                           -- идемпотентность колбэка с решением
     PRIMARY KEY (transfer_id, attempt)
 );

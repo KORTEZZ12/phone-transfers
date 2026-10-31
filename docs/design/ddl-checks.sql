@@ -271,6 +271,61 @@ DO $$ BEGIN
   RAISE NOTICE 'ok  TR-30 регламентная проверка находит перевод без открытой задачи';
 END $$;
 
+-- TR-35…TR-37, 161-ФЗ: приостановка, подтверждение клиентом, отложенное исполнение
+DO $$ BEGIN
+  ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 200, 300000, 500000, 2000000) = 'OK';
+  INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+  VALUES ('40000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000001',
+          '50000000-0000-0000-0000-000000000006', 'h6', '20000000-0000-0000-0000-000000000002',
+          '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
+          'RUB', 200, 200, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+  UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000006';
+  UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000006';
+  UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = TIMESTAMPTZ '2026-10-20 23:59:59+03'
+   WHERE id = '40000000-0000-0000-0000-000000000006';
+  -- клиент подтвердил: повторная сверка с базой ЦБ
+  UPDATE transfers.transfer SET status = 'CHECKING', confirmed_at = now() WHERE id = '40000000-0000-0000-0000-000000000006';
+  ASSERT EXISTS (SELECT 1 FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000006'
+                  AND kind = 'CONFIRMATION_CHECK' AND done_at IS NULL), 'после подтверждения — повторная сверка';
+  BEGIN
+    UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = now() + interval '1 day'
+     WHERE id = '40000000-0000-0000-0000-000000000006';
+    RAISE EXCEPTION 'подтверждённый перевод приостановлен второй раз';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  -- по базе ЦБ пришли сведения: исполнение откладывается на 2 дня
+  UPDATE transfers.transfer SET status = 'COOLING', execute_after = TIMESTAMPTZ '2026-10-22 10:00+03'
+   WHERE id = '40000000-0000-0000-0000-000000000006';
+  ASSERT (SELECT due_at FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000006' AND kind = 'RESUME')
+         = TIMESTAMPTZ '2026-10-22 10:00+03', 'возобновление стоит на момент execute_after';
+  UPDATE transfers.transfer SET status = 'POSTING' WHERE id = '40000000-0000-0000-0000-000000000006';
+  UPDATE transfers.transfer SET status = 'COMPLETED', completed_at = now() WHERE id = '40000000-0000-0000-0000-000000000006';
+  ASSERT (SELECT array_agg(payload->>'status' ORDER BY transfer_version) FROM transfers.outbox_event
+           WHERE transfer_id = '40000000-0000-0000-0000-000000000006')
+         = ARRAY['PROCESSING', 'AWAITING_CONFIRMATION', 'PROCESSING', 'DELAYED', 'PROCESSING', 'COMPLETED'];
+  RAISE NOTICE 'ok  TR-35…TR-37 приостановка, подтверждение, отложенное исполнение и события для клиента';
+END $$;
+
+-- TR-36: не подтвердил к сроку — отказ NOT_CONFIRMED и снятие холда
+DO $$ BEGIN
+  ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 300, 300000, 500000, 2000000) = 'OK';
+  INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status)
+  VALUES ('40000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000001',
+          '50000000-0000-0000-0000-000000000007', 'h7', '20000000-0000-0000-0000-000000000002',
+          '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
+          'RUB', 300, 300, DATE '2026-10-19', DATE '2026-10-01', 'NEW');
+  UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000007';
+  UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000007';
+  UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = TIMESTAMPTZ '2026-10-20 23:59:59+03'
+   WHERE id = '40000000-0000-0000-0000-000000000007';
+  UPDATE transfers.transfer SET status = 'REJECTED', reject_reason = 'NOT_CONFIRMED' WHERE id = '40000000-0000-0000-0000-000000000007';
+  ASSERT EXISTS (SELECT 1 FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000007'
+                  AND kind = 'RELEASE_HOLD' AND done_at IS NULL), 'неподтверждённый перевод снимает холд';
+  RAISE NOTICE 'ok  TR-36 без подтверждения к сроку — отказ и снятие холда';
+END $$;
+
 -- Маппинг ответа ЦБ (cbr-dailyinfo.md): фрагмент реального ответа GetCursOnDateXML от 19.10.2026.
 -- Обёртка в пространстве имён web.cbr.ru, сами курсы — без пространства имён (xmlns="")
 DO $$

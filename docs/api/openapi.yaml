@@ -325,9 +325,10 @@ paths:
       operationId: cancelTransfer
       summary: Отменить перевод на проверке
       description: |
-        Отменить можно только перевод в статусе ON_REVIEW (TR-22). Повторная отмена отменённого
-        перевода возвращает 200 и тот же перевод, поэтому ключ идемпотентности не нужен.
-        Если одновременно пришло решение антифрода, применяется то, что зафиксировано первым (TR-23).
+        Отменить можно перевод в статусах ON_REVIEW, AWAITING_CONFIRMATION и DELAYED (TR-22).
+        Повторная отмена отменённого перевода возвращает 200 и тот же перевод, поэтому ключ
+        идемпотентности не нужен. Если одновременно пришло решение антифрода или подтверждение,
+        применяется то, что зафиксировано первым (TR-23).
       parameters:
         - $ref: '#/components/parameters/TransferId'
         - $ref: '#/components/parameters/Traceparent'
@@ -370,6 +371,65 @@ paths:
                 code: TRANSFER_NOT_CANCELLABLE
                 detail: Перевод уже выполнен.
                 currentStatus: COMPLETED
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  /v1/transfers/{transferId}/confirm:
+    post:
+      tags: [Переводы]
+      operationId: confirmTransfer
+      summary: Подтвердить перевод, приостановленный по 161-ФЗ
+      description: |
+        Перевод в статусе AWAITING_CONFIRMATION приостановлен: антифрод нашёл признаки перевода
+        без добровольного согласия клиента (TR-35). Подтвердить можно до `confirmationDeadline` (TR-36).
+        После подтверждения антифрод заново сверяется с базой Банка России: перевод идёт в обработку
+        или откладывается до `executeAfter` (TR-37).
+
+        Подтверждение идемпотентно: повторное подтверждение подтверждённого перевода возвращает 200
+        и тот же перевод (TR-38). Если одновременно пришла отмена, применяется то, что зафиксировано первым (TR-23).
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+        - $ref: '#/components/parameters/Traceparent'
+      responses:
+        '200':
+          description: Перевод подтверждён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+              example:
+                id: 3d2c1b0a-9f8e-4d7c-8b6a-5f4e3d2c1b0a
+                status: PROCESSING
+                rejectReason: null
+                amount:
+                  value: '150000.00'
+                  currency: RUB
+                recipient:
+                  displayName: Иван П.
+                sourceAccountId: 0b8e7d6c-5a4f-4e3d-9c2b-1a0f9e8d7c6b
+                comment: null
+                cancellable: false
+                confirmable: false
+                confirmationDeadline: null
+                executeAfter: null
+                createdAt: '2026-10-19T12:01:03+03:00'
+                updatedAt: '2026-10-19T18:40:12+03:00'
+                completedAt: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/TransferNotFound'
+        '409':
+          description: Перевод уже нельзя подтвердить
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://api.bank.example/problems/transfer-not-confirmable
+                title: Перевод уже нельзя подтвердить
+                status: 409
+                code: TRANSFER_NOT_CONFIRMABLE
+                detail: Срок подтверждения истёк, перевод отклонён.
+                currentStatus: REJECTED
                 traceId: 4bf92f3577b34da6a3ce929d0e0e4736
   /v1/transfer-limits:
     get:
@@ -421,6 +481,8 @@ paths:
       summary: Решение антифрода по ручной проверке
       description: |
         Вызывает антифрод, когда сотрудник принял решение. Идемпотентно по `decisionId`.
+        Решение SUSPEND приостанавливает перевод до подтверждения клиентом (TR-35).
+        Если перевод ещё в CHECKING, решение сохраняется и применяется при переходе в REVIEW.
         Если перевод уже в финальном статусе (отменён отправителем или истёк срок проверки),
         ответ — 200 с `applied: false` и текущим статусом: антифроду нечего исправлять,
         ему нужно только закрыть кейс. Ошибка 4xx тут бесполезна, на неё нельзя отреагировать.
@@ -668,8 +730,9 @@ components:
       description: |
         Статус для клиента. Внутренние статусы сервиса отображаются так:
         NEW, HELD, CHECKING, POSTING → PROCESSING; REVIEW → ON_REVIEW;
-        остальные совпадают. См. статусную модель.
-      enum: [PROCESSING, ON_REVIEW, COMPLETED, REJECTED, CANCELLED, FAILED]
+        SUSPENDED → AWAITING_CONFIRMATION; COOLING → DELAYED; остальные совпадают.
+        См. статусную модель.
+      enum: [PROCESSING, ON_REVIEW, AWAITING_CONFIRMATION, DELAYED, COMPLETED, REJECTED, CANCELLED, FAILED]
     RejectReason:
       type: string
       enum:
@@ -677,6 +740,7 @@ components:
         - FRAUD_SUSPECTED
         - REVIEW_EXPIRED
         - RECIPIENT_ACCOUNT_UNAVAILABLE
+        - NOT_CONFIRMED
     Transfer:
       type: object
       required: [id, status, amount, recipient, sourceAccountId, cancellable, createdAt, updatedAt]
@@ -707,6 +771,17 @@ components:
         cancellable:
           type: boolean
           description: Можно ли отменить прямо сейчас
+        confirmable:
+          type: boolean
+          description: Можно ли подтвердить прямо сейчас — только для AWAITING_CONFIRMATION
+        confirmationDeadline:
+          type: [string, 'null']
+          format: date-time
+          description: До какого момента можно подтвердить приостановленный перевод (P-20)
+        executeAfter:
+          type: [string, 'null']
+          format: date-time
+          description: Не раньше какого момента будет исполнен отложенный перевод (P-21)
         createdAt:
           type: string
           format: date-time
@@ -751,7 +826,7 @@ components:
           format: uuid
         decision:
           type: string
-          enum: [ALLOW, DENY]
+          enum: [ALLOW, DENY, SUSPEND]
         decidedAt:
           type: string
           format: date-time
@@ -801,6 +876,7 @@ components:
             - SOURCE_ACCOUNT_UNAVAILABLE
             - TRANSFER_NOT_FOUND
             - TRANSFER_NOT_CANCELLABLE
+            - TRANSFER_NOT_CONFIRMABLE
             - SERVICE_UNAVAILABLE
         traceId:
           type: string
