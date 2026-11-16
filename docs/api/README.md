@@ -1,6 +1,6 @@
 # Соглашения API
 
-Версия 0.3. Контракты: [`openapi.yaml`](openapi.yaml) — API для приложения, [`internal-antifraud.yaml`](internal-antifraud.yaml) — колбэк антифрода во внутреннем контуре, [`asyncapi.yaml`](asyncapi.yaml) — события в Kafka. Документация публичного API — [`index.html`](index.html), её публикует GitHub Pages.
+Версия 0.4. Контракты: [`openapi.yaml`](openapi.yaml) — API для приложения, [`internal-antifraud.yaml`](internal-antifraud.yaml) — колбэк антифрода во внутреннем контуре, [`asyncapi.yaml`](asyncapi.yaml) — события в Kafka. Документация публичного API — [`index.html`](index.html), её публикует GitHub Pages.
 
 ## Проверка контрактов
 

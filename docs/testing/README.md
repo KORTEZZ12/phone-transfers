@@ -7,11 +7,11 @@
 | Что | Где | Сколько |
 |---|---|---|
 | Mock-сервер с состоянием: правила, сбои, виртуальное время | [`mock/`](../../mock/README.md) | 7 операций публичного и внутреннего API, управляющий API для сбоев |
-| Postman-коллекция по таблице отказов и историям | [`tests/postman`](../../tests/postman/phone-transfers.postman_collection.json), собирается из [`scenarios.mjs`](../../tests/postman/scenarios.mjs) | 11 папок, 293 запроса, около 690 проверок |
+| Postman-коллекция по таблице отказов и историям | [`tests/postman`](../../tests/postman/phone-transfers.postman_collection.json), собирается из [`scenarios.mjs`](../../tests/postman/scenarios.mjs) | 11 папок, 296 запросов, около 700 проверок |
 | Проверка каждого ответа по OpenAPI | общий скрипт коллекции, схемы из [`openapi.yaml`](../api/openapi.yaml) и [`internal-antifraud.yaml`](../api/internal-antifraud.yaml) | код ответа описан, тело по схеме, лишних полей нет, заголовки на месте |
 | Проверка событий по AsyncAPI | папка «09 События, пуши и outbox» | полезная нагрузка по схеме [`asyncapi.yaml`](../api/asyncapi.yaml) |
 | Параллельные запросы | [`tests/concurrency-check.mjs`](../../tests/concurrency-check.mjs) | отказы 1, 4, 20 |
-| Ежедневная сверка и витрина для отчётности | [`reconciliation.sql`](../design/reconciliation.sql), [`reconciliation-checks.sql`](../design/reconciliation-checks.sql) | 13 проверок на PostgreSQL 16 |
+| Ежедневная сверка и витрина для отчётности | [`reconciliation.sql`](../design/reconciliation.sql), [`reconciliation-checks.sql`](../design/reconciliation-checks.sql) | 15 проверок на PostgreSQL 16 |
 
 Какая строка таблицы отказов, какое правило и какая история чем проверены, видно в [матрице покрытия](coverage.md). Её собирает сборщик коллекции, поэтому матрица не расходится со сценариями. Проверены все 30 строк таблицы отказов и все 7 историй: 29 строк — в коллекции, строка 20 — параллельными запросами к mock и нагрузочным тестом леджера на PostgreSQL. Из 38 правил вне коллекции два: TR-15 (неизменяемость проводок проверяет `ddl-checks.sql`) и TR-33 (комиссий нет, проверено ревью).
 
