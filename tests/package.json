@@ -1,0 +1,14 @@
+{
+  "name": "phone-transfers-tests",
+  "private": true,
+  "description": "Сборка и прогон Postman-коллекции против mock-сервера",
+  "type": "module",
+  "scripts": {
+    "build": "node postman/build.mjs",
+    "test": "newman run postman/phone-transfers.postman_collection.json -e postman/mock.postman_environment.json --reporters cli"
+  },
+  "devDependencies": {
+    "newman": "6.2.3",
+    "yaml": "2.9.1"
+  }
+}
