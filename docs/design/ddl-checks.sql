@@ -317,7 +317,7 @@ DO $$ BEGIN
           'RUB', 200, 200, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
   UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000006';
   UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000006';
-  UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = TIMESTAMPTZ '2026-10-20 23:59:59+03'
+  UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = now() + interval '1 day'
    WHERE id = '40000000-0000-0000-0000-000000000006';
   -- клиент подтвердил: повторная сверка с базой ЦБ
   UPDATE transfers.transfer SET status = 'CHECKING', confirmed_at = now() WHERE id = '40000000-0000-0000-0000-000000000006';
@@ -356,12 +356,53 @@ DO $$ BEGIN
           'RUB', 300, 300, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
   UPDATE transfers.transfer SET status = 'HELD' WHERE id = '40000000-0000-0000-0000-000000000007';
   UPDATE transfers.transfer SET status = 'CHECKING' WHERE id = '40000000-0000-0000-0000-000000000007';
-  UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = TIMESTAMPTZ '2026-10-20 23:59:59+03'
+  UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = now() + interval '1 day'
    WHERE id = '40000000-0000-0000-0000-000000000007';
   UPDATE transfers.transfer SET status = 'REJECTED', reject_reason = 'NOT_CONFIRMED' WHERE id = '40000000-0000-0000-0000-000000000007';
   ASSERT EXISTS (SELECT 1 FROM transfers.task WHERE transfer_id = '40000000-0000-0000-0000-000000000007'
                   AND kind = 'RELEASE_HOLD' AND done_at IS NULL), 'неподтверждённый перевод снимает холд';
   RAISE NOTICE 'ok  TR-36 без подтверждения к сроку — отказ и снятие холда';
+END $$;
+
+-- TR-21, TR-36: после срока подтвердить, отменить или применить решение нельзя — только отказ.
+-- Срок держит guard_transfer, а не регламентная проверка раз в P-08
+DO $$ BEGIN
+  ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 100, 300000, 500000, 2000000) = 'OK';
+  ASSERT transfers.reserve_limit('10000000-0000-0000-0000-000000000001', DATE '2026-10-19', 100, 300000, 500000, 2000000) = 'OK';
+  INSERT INTO transfers.transfer (id, sender_client_id, idempotency_key, request_hash, recipient_client_id,
+         source_account_id, target_account_id, currency, amount, amount_rub, limit_day, limit_month, status, created_at)
+  VALUES ('40000000-0000-0000-0000-000000000008', '10000000-0000-0000-0000-000000000001',
+          '50000000-0000-0000-0000-000000000008', 'h8', '20000000-0000-0000-0000-000000000002',
+          '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
+          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03'),
+         ('40000000-0000-0000-0000-000000000009', '10000000-0000-0000-0000-000000000001',
+          '50000000-0000-0000-0000-000000000009', 'h9', '20000000-0000-0000-0000-000000000002',
+          '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2',
+          'RUB', 100, 100, DATE '2026-10-19', DATE '2026-10-01', 'NEW', TIMESTAMPTZ '2026-10-19 12:00+03');
+  UPDATE transfers.transfer SET status = 'HELD' WHERE id IN ('40000000-0000-0000-0000-000000000008', '40000000-0000-0000-0000-000000000009');
+  UPDATE transfers.transfer SET status = 'CHECKING' WHERE id IN ('40000000-0000-0000-0000-000000000008', '40000000-0000-0000-0000-000000000009');
+  UPDATE transfers.transfer SET status = 'SUSPENDED', confirmation_deadline = now() - interval '1 second'
+   WHERE id = '40000000-0000-0000-0000-000000000008';
+  UPDATE transfers.transfer SET status = 'REVIEW', review_deadline = now() - interval '1 second'
+   WHERE id = '40000000-0000-0000-0000-000000000009';
+  BEGIN
+    UPDATE transfers.transfer SET status = 'CHECKING', confirmed_at = now() WHERE id = '40000000-0000-0000-0000-000000000008';
+    RAISE EXCEPTION 'подтверждение после срока прошло';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    UPDATE transfers.transfer SET status = 'CANCELLED' WHERE id = '40000000-0000-0000-0000-000000000008';
+    RAISE EXCEPTION 'отмена после срока подтверждения прошла';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    UPDATE transfers.transfer SET status = 'POSTING' WHERE id = '40000000-0000-0000-0000-000000000009';
+    RAISE EXCEPTION 'решение по проверке после срока применено';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  UPDATE transfers.transfer SET status = 'REJECTED', reject_reason = 'NOT_CONFIRMED' WHERE id = '40000000-0000-0000-0000-000000000008';
+  UPDATE transfers.transfer SET status = 'REJECTED', reject_reason = 'REVIEW_EXPIRED' WHERE id = '40000000-0000-0000-0000-000000000009';
+  RAISE NOTICE 'ok  TR-21, TR-36 после срока подтверждение, отмена и решение отклоняются, остаётся только отказ';
 END $$;
 
 -- Маппинг ответа ЦБ (cbr-dailyinfo.md): фрагмент реального ответа GetCursOnDateXML от 19.10.2026.

@@ -1,1 +1,3 @@
 node_modules/
+tests/newman-report.xml
+mock.log

@@ -64,6 +64,47 @@ jobs:
           createdb pt_conc
           psql -X -q -v ON_ERROR_STOP=1 -d pt_conc -f ddl.sql
           DB=pt_conc ./ledger-concurrency-check.sh
+      - name: Ежедневная сверка и витрина для отчётности
+        working-directory: docs/design
+        run: |
+          createdb pt_recon
+          psql -X -q -v ON_ERROR_STOP=1 -d pt_recon -f ddl.sql -f reconciliation.sql -f reconciliation-checks.sql
+
+  mock:
+    name: Mock-сервер и Postman по таблице отказов
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tests/package-lock.json
+      - name: Зависимости тестов
+        working-directory: tests
+        run: npm ci
+      - name: Коллекция и матрица покрытия собраны из текущих сценариев и контрактов
+        run: |
+          node tests/postman/build.mjs
+          git diff --exit-code -- tests/postman docs/testing/coverage.md || { echo "Запустите node tests/postman/build.mjs и закоммитьте результат"; exit 1; }
+      - name: Запуск mock-сервера
+        run: |
+          MOCK_AUTO_TICK_MS=0 node mock/server.mjs > mock.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:4010/__mock/clock > /dev/null && exit 0; sleep 0.5; done
+          cat mock.log; exit 1
+      - name: Postman-коллекция через Newman
+        working-directory: tests
+        run: npx newman run postman/phone-transfers.postman_collection.json -e postman/mock.postman_environment.json --reporters cli,junit --reporter-junit-export newman-report.xml --reporter-cli-no-success-assertions
+      - name: Параллельные запросы
+        run: node tests/concurrency-check.mjs
+      - name: Отчёт Newman и журнал mock
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newman-report
+          path: |
+            tests/newman-report.xml
+            mock.log
 
   docs:
     name: Ссылки в документации
