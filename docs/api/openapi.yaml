@@ -813,7 +813,9 @@ components:
         existingTransferId:
           type: string
           format: uuid
-          description: Перевод, уже созданный с этим ключом. Есть только у IDEMPOTENCY_KEY_REUSED
+          description: |
+            Перевод, уже созданный с этим ключом. Есть только у IDEMPOTENCY_KEY_REUSED и только если
+            исходный запрос принят: у синхронно отклонённого запроса перевода как ресурса нет (D-15)
         limit:
           type: object
           required: [period, available]

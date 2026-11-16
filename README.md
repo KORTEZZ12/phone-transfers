@@ -15,6 +15,7 @@
 2. [SD-2](docs/design/sequences.md#sd-2-повторы-и-потерянный-ответ) и [SD-5](docs/design/sequences.md#sd-5-неизвестный-исход-проводки): потерянный ответ и неизвестный исход проводки.
 3. [ADR-001](docs/decisions/adr/ADR-001-sync-until-hold.md): почему клиент ждёт ответа только до блокировки суммы.
 4. [Ревью](docs/reviews/README.md): две независимые проверки нашли 21 проблему, каждую я завёл issue и закрыл PR.
+5. [Итерация 3](docs/testing/README.md): mock-сервер с правилами проекта и Postman-коллекция по таблице отказов. Каждый ответ сверяется с OpenAPI. Mock нашёл восемь мест, где требования не давали ответа.
 
 Так перевод проходит статусы внутри сервиса:
 
@@ -56,7 +57,8 @@ stateDiagram-v2
 | Писать требования, которые можно проверить | [Бизнес-правила](docs/requirements/business-rules.md) с параметрами вместо чисел в тексте, [НФТ](docs/requirements/nfr.md) с точкой измерения, [истории](docs/requirements/user-stories.md) с критериями на Gherkin, [трассировка](docs/requirements/business-rules.md#трассировка-правило--проверка) каждого правила до проверки |
 | Проектировать интеграции | [OpenAPI](docs/api/openapi.yaml), где у каждого кода ошибки есть реакция приложения; [AsyncAPI](docs/api/asyncapi.yaml); SOAP ЦБ, [сверенный живым вызовом](docs/integrations/cbr-dailyinfo.md) |
 | Закладывать надёжность | Идемпотентность, outbox, задачи продолжения в той же транзакции, что и статус; [гонки проверены нагрузочным тестом](docs/design/ledger-concurrency-check.sh) |
-| Работать с данными | [Модель данных](docs/design/data-model.md): правила держит база, а не текст; 22 проверки на PostgreSQL 16 |
+| Работать с данными | [Модель данных](docs/design/data-model.md): правила держит база, а не текст; 22 проверки на PostgreSQL 16. [Сверка и витрина](docs/design/reconciliation.md): расхождения в деньгах и метрики видения одним запросом |
+| Проверять требования | [Mock-сервер](mock/README.md) с правилами проекта и сбоями по запросу, [Postman-коллекция](docs/testing/README.md) по таблице отказов и историям, [матрица покрытия](docs/testing/coverage.md) строк, правил и историй |
 | Описывать процессы с людьми | [BPMN процесса по 161-ФЗ](docs/design/bpmn/README.md), [runbook](docs/operations/runbook.md) операционного отдела, [состояния экрана](docs/design/client-states.md) |
 | Принимать и объяснять решения | [Журнал решений](docs/decisions/decision-log.md) и шесть [ADR](docs/decisions/adr) с отвергнутыми вариантами |
 | Работать с замечаниями | [Отчёты ревью](docs/reviews/README.md), issues и PR по каждой находке |
@@ -70,7 +72,18 @@ DB=pt_check ./concurrency-check.sh
 createdb pt_conc && psql -d pt_conc -f ddl.sql && DB=pt_conc ./ledger-concurrency-check.sh
 ```
 
-Это и проверку контрактов CI запускает на каждый PR: [checks.yml](.github/workflows/checks.yml).
+Mock-сервер и Postman-коллекция:
+
+```bash
+cd tests && npm ci && cd ..
+MOCK_AUTO_TICK_MS=0 node mock/server.mjs &
+npx --prefix tests newman run tests/postman/phone-transfers.postman_collection.json -e tests/postman/mock.postman_environment.json
+node tests/concurrency-check.mjs
+```
+
+Сверка и витрина: `createdb pt_recon && psql -d pt_recon -f ddl.sql -f reconciliation.sql -f reconciliation-checks.sql` в `docs/design`.
+
+Всё это и проверку контрактов CI запускает на каждый PR: [checks.yml](.github/workflows/checks.yml).
 
 ## Кто что делал
 
@@ -97,8 +110,10 @@ createdb pt_conc && psql -d pt_conc -f ddl.sql && DB=pt_conc ./ledger-concurrenc
 | Runbook | [docs/operations/runbook.md](docs/operations/runbook.md) | 0.3 |
 | ADR и журнал решений | [docs/decisions](docs/decisions/decision-log.md) | 0.3 |
 | Отчёты ревью | [docs/reviews](docs/reviews/README.md) | 0.3 |
-| Mock, Postman, SQL сверки | — | итерация 3 |
+| Mock-сервер | [mock](mock/README.md) | 0.4 |
+| Postman-коллекция, матрица покрытия, находки итерации 3 | [docs/testing](docs/testing/README.md) | 0.4 |
+| Сверка и витрина для отчётности | [docs/design/reconciliation.md](docs/design/reconciliation.md) | 0.4 |
 
 ## Статус
 
-Версия 0.3. Готовы итерации 1, 2 и 4: требования, контракты, модель данных, интеграции, ревью и исправления по нему. Дальше итерация 3: поднять mock-сервер, написать тесты Postman по таблице отказов и историям, собрать SQL сверки. [CHANGELOG](CHANGELOG.md).
+Версия 0.4. Готовы все четыре итерации: требования, контракты, модель данных, интеграции, ревью и исправления по нему, mock-сервер, Postman-коллекция по таблице отказов, сверка и витрина. Решения D-15…D-18 по находкам итерации 3 ждут подтверждения. [CHANGELOG](CHANGELOG.md).
