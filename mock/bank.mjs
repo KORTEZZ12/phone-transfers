@@ -795,8 +795,9 @@ export class Bank {
     if (!t || t.syncProblem) throw new ApiError('TRANSFER_NOT_FOUND');
     this.applyDeadlines(t);
     let applied = false;
-    if (t.status === 'CHECKING') {
-      t.pendingDecision = body.decision; // применится при переходе в REVIEW
+    if (t.status === 'CHECKING' && !t.confirmedAt) {
+      // Первичная проверка ещё идёт: решение сотрудника пришло раньше, чем сервис записал REVIEW
+      t.pendingDecision = body.decision;
       applied = true;
     } else if (t.status === 'REVIEW') {
       this.applyReviewDecision(t, body.decision);
@@ -936,6 +937,12 @@ export class Bank {
       return;
     }
     this.finishTask(task, decision);
+    if (t.pendingDecision && decision !== 'REVIEW') {
+      // Колбэк с решением сотрудника пришёл, а проверка ответила сама: применяется ответ проверки,
+      // расхождение антифрода разбирается как инцидент. Колбэку уже ответили applied: true
+      this.incident('ANTIFRAUD_DECISION_DISCARDED', t.id, `Решение сотрудника ${t.pendingDecision} не применено: проверка ответила ${decision}`);
+      t.pendingDecision = null;
+    }
     if (decision === 'ALLOW') this.transition(t, 'POSTING');
     else if (decision === 'DENY') this.transition(t, 'REJECTED', { rejectReason: 'FRAUD_SUSPECTED' });
     else if (decision === 'SUSPEND') this.suspend(t);

@@ -238,10 +238,51 @@ DO $$ BEGIN
   ASSERT (SELECT value = 1 AND NOT ok FROM reporting.vision_metrics(reporting.msk_day(now()), reporting.msk_day(now()))
            WHERE metric = 'Переводов в промежуточном статусе без открытой задачи');
   ASSERT (SELECT value = 0 AND ok FROM reporting.vision_metrics(reporting.msk_day(now()), reporting.msk_day(now()))
-           WHERE metric = 'Переводов с двумя списаниями');
+           WHERE metric LIKE 'Переводов с двумя списаниями%');
   ASSERT (SELECT NOT ok FROM reporting.vision_metrics(reporting.msk_day(now()), reporting.msk_day(now()))
            WHERE metric = 'Расхождений ежедневной сверки');
   RAISE NOTICE 'ok  метрики видения: потерянный перевод и расхождения сверки';
+END $$;
+
+-- Метрика «завершён за P-12»: перевод, закрытый из NEW регламентной проверкой, — невыполнение, а не исключение.
+-- Синхронный отказ в знаменатель не входит
+DO $$
+DECLARE before numeric; after numeric; n_before bigint; n_after bigint;
+BEGIN
+  SELECT value INTO before FROM reporting.vision_metrics(reporting.msk_day(now()), reporting.msk_day(now()))
+   WHERE metric LIKE 'Доля переводов без ожидания человека%';
+  SELECT count(*) INTO n_before FROM reporting.transfer_facts WHERE NOT sync_rejected AND NOT waited_for_human
+     AND (finished_at IS NOT NULL OR created_at < now() - interval '5 minutes');
+  PERFORM pg_temp.new_transfer('40000000-0000-0000-0000-000000000012', 100);
+  -- создан 6 минут назад, холда не было; регламентная проверка закрыла его как FAILED
+  SET LOCAL session_replication_role = replica;
+  UPDATE transfers.transfer SET created_at = now() - interval '6 minutes' WHERE id = '40000000-0000-0000-0000-000000000012';
+  SET LOCAL session_replication_role = origin;
+  UPDATE transfers.transfer SET status = 'FAILED' WHERE id = '40000000-0000-0000-0000-000000000012';
+  ASSERT (SELECT NOT accepted AND NOT sync_rejected FROM reporting.transfer_facts WHERE id = '40000000-0000-0000-0000-000000000012'),
+         'FAILED из NEW — не синхронный отказ';
+  SELECT count(*) INTO n_after FROM reporting.transfer_facts WHERE NOT sync_rejected AND NOT waited_for_human
+     AND (finished_at IS NOT NULL OR created_at < now() - interval '5 minutes');
+  ASSERT n_after = n_before + 1, 'FAILED из NEW попал в знаменатель';
+  SELECT value INTO after FROM reporting.vision_metrics(reporting.msk_day(now()), reporting.msk_day(now()))
+   WHERE metric LIKE 'Доля переводов без ожидания человека%';
+  ASSERT after < before, format('доля должна упасть: было %s, стало %s', before, after);
+  ASSERT NOT EXISTS (SELECT 1 FROM reporting.transfer_facts WHERE sync_rejected AND reject_reason <> 'LIMIT_EXCEEDED'
+                      AND id = '40000000-0000-0000-0000-000000000003'), 'отказ по лимиту — синхронный';
+  RAISE NOTICE 'ok  метрика «завершён за P-12»: зависший в NEW перевод портит её, синхронный отказ не входит';
+END $$;
+
+-- Сигнал о двойном переводе от приложения: те же данные, разные ключи, меньше минуты
+DO $$ BEGIN
+  ASSERT (SELECT value = 0 AND ok IS NULL FROM reporting.vision_metrics(reporting.msk_day(now()), reporting.msk_day(now()))
+           WHERE metric LIKE 'Подозрений на двойной перевод%'), 'до дубля сигнала нет';
+  PERFORM pg_temp.new_transfer('40000000-0000-0000-0000-000000000013', 333);
+  PERFORM pg_temp.complete('40000000-0000-0000-0000-000000000013');
+  PERFORM pg_temp.new_transfer('40000000-0000-0000-0000-000000000014', 333);
+  PERFORM pg_temp.complete('40000000-0000-0000-0000-000000000014');
+  ASSERT (SELECT value = 1 FROM reporting.vision_metrics(reporting.msk_day(now()), reporting.msk_day(now()))
+           WHERE metric LIKE 'Подозрений на двойной перевод%'), 'дубль с новым ключом виден';
+  RAISE NOTICE 'ok  двойной перевод с новым ключом виден как сигнал, хотя ограничения ключа его не ловят';
 END $$;
 
 \echo 'Все проверки сверки и витрины пройдены'

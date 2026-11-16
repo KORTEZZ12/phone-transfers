@@ -349,6 +349,17 @@ BEGIN
         SELECT 1 FROM transfers.status_transition WHERE from_status = OLD.status AND to_status = NEW.status) THEN
         RAISE EXCEPTION 'Переход % → % запрещён статусной моделью', OLD.status, NEW.status;
     END IF;
+    -- После срока остаётся только отказ: подтвердить или отменить приостановленный перевод можно до P-20 (TR-36),
+    -- решение по ручной проверке применяется до P-11 (TR-21). Срок держит база, а не регламентная проверка:
+    -- она приходит раз в P-08 и иначе оставляла бы окно, в котором действие после срока проходит
+    IF OLD.status = 'SUSPENDED' AND NEW.status IN ('CHECKING', 'CANCELLED') AND now() >= OLD.confirmation_deadline THEN
+        RAISE EXCEPTION 'Срок подтверждения перевода % истёк: остаётся только отказ NOT_CONFIRMED', OLD.id
+              USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status = 'REVIEW' AND NEW.status IN ('POSTING', 'SUSPENDED', 'CANCELLED') AND now() >= OLD.review_deadline THEN
+        RAISE EXCEPTION 'Срок ручной проверки перевода % истёк: остаётся только отказ REVIEW_EXPIRED', OLD.id
+              USING ERRCODE = 'check_violation';
+    END IF;
     NEW.version := OLD.version + 1;
     NEW.updated_at := now();
     RETURN NEW;

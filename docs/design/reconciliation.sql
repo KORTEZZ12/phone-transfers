@@ -142,6 +142,10 @@ SELECT t.id,
        t.reject_reason,
        -- принят к исполнению: сумма была заблокирована, первое событие — при холде (TR-27)
        EXISTS (SELECT 1 FROM transfers.outbox_event e WHERE e.transfer_id = t.id) AS accepted,
+       -- отклонён синхронно: лимит, остаток или счёт до холда, клиент получил 422 и событий нет.
+       -- Перевод, который регламентная проверка закрыла из NEW, тоже без событий, но это не синхронный отказ,
+       -- а самый зависший перевод: из метрик «не висят» он не исключается
+       (t.status = 'REJECTED' AND NOT EXISTS (SELECT 1 FROM transfers.outbox_event e WHERE e.transfer_id = t.id)) AS sync_rejected,
        -- ждал человека: сотрудника на ручной проверке или клиента по 161-ФЗ. Таймаут антифрода сюда не входит
        (EXISTS (SELECT 1 FROM transfers.antifraud_check c
                  WHERE c.transfer_id = t.id AND (c.outcome IN ('REVIEW', 'SUSPEND') OR c.decision_id IS NOT NULL))
@@ -178,7 +182,7 @@ SELECT day,
        count(*) FILTER (WHERE antifraud_timeout)                             AS antifraud_timeout,
        -- NFR-02, серверная часть: от создания до финального события, переводы без ожидания человека
        percentile_cont(0.95) WITHIN GROUP (ORDER BY seconds_to_final)
-           FILTER (WHERE accepted AND NOT waited_for_human AND finished_at IS NOT NULL) AS p95_seconds_to_final
+           FILTER (WHERE NOT sync_rejected AND NOT waited_for_human AND finished_at IS NOT NULL) AS p95_seconds_to_final
   FROM reporting.transfer_facts
  GROUP BY day, currency;
 
@@ -197,11 +201,24 @@ LANGUAGE sql STABLE AS $$
 WITH f AS (
     SELECT * FROM reporting.transfer_facts WHERE day BETWEEN p_from AND p_to
 ), no_human AS (
-    SELECT * FROM f WHERE accepted AND NOT waited_for_human
+    SELECT * FROM f WHERE NOT sync_rejected AND NOT waited_for_human
 )
-SELECT 'Переводов с двумя списаниями', count(*)::numeric, '0', count(*) = 0
+-- Двух списаний по одному переводу и двух переводов по одному ключу не бывает по построению:
+-- UNIQUE (transfer_id, kind) у проводок и UNIQUE (sender_client_id, idempotency_key) у переводов.
+-- Строка остаётся как проверка ограничений, а не как измерение
+SELECT 'Переводов с двумя списаниями по одному ключу (0 по построению: ограничения UNIQUE)', count(*)::numeric, '0', count(*) = 0
   FROM (SELECT p.transfer_id FROM ledger.posting p WHERE p.kind = 'TRANSFER'
           AND p.transfer_id IN (SELECT id FROM f) GROUP BY p.transfer_id HAVING count(*) > 1) x
+UNION ALL
+-- Реальный двойной перевод — приложение создало новый ключ на повторное нажатие — ключом не ловится.
+-- Сигнал: тот же отправитель, получатель, сумма и валюта, разные ключи, оба выполнены, между созданием меньше минуты.
+-- Законные повторные переводы бывают, поэтому цели нет: значение разбирают вместе с телеметрией приложения
+SELECT 'Подозрений на двойной перевод от приложения: разные ключи, те же данные, меньше минуты', count(*)::numeric, 'сигнал, без цели', NULL::boolean
+  FROM f a JOIN f b
+    ON a.sender_client_id = b.sender_client_id AND a.recipient_client_id = b.recipient_client_id
+   AND a.currency = b.currency AND a.amount = b.amount AND a.id < b.id
+   AND a.status = 'COMPLETED' AND b.status = 'COMPLETED'
+   AND abs(EXTRACT(EPOCH FROM b.created_at - a.created_at)) < 60
 UNION ALL
 SELECT 'Переводов в промежуточном статусе без открытой задачи', count(*)::numeric, '0', count(*) = 0
   FROM f

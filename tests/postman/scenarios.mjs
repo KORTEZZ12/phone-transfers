@@ -140,7 +140,11 @@ export const folders = [
       const b = json();
       pm.test('TR-01 имя и первая буква фамилии', () => pm.expect(b.displayName).to.equal('Иван П.'));
       pm.test('TR-05 валюты основных счетов получателя', () => pm.expect(b.currencies).to.eql(['RUB', 'USD']));
-      pm.test('TR-02 токен действует 10 минут', () => pm.expect(b.expiresAt).to.equal('2026-11-16T12:10:00+03:00'));
+      // Часы mock идут вместе с реальными: сравниваем с текущим временем mock, а не с константой
+      mock('GET', '/clock', null, (c) => pm.test('TR-02 токен действует 10 минут', () => {
+        const left = ms(b.expiresAt) - ms(c.now);
+        pm.expect(left).to.be.within(10 * MIN - 1000, 10 * MIN);
+      }));
       setv('tok', b.recipientToken);
     }),
     lookup('Сетевой повтор того же номера возвращает тот же токен', { phone: PHONE.ivan, save: 'tok2' }, function () {
@@ -487,7 +491,11 @@ export const folders = [
     decision('Повтор колбэка с тем же decisionId — тот же результат', 't2', 'ALLOW', 'd2', function () {
       pm.test('Тот же ответ', () => pm.expect(json()).to.eql({ applied: true, transferStatus: 'PROCESSING' }));
     }, false),
-    cancel('US-04: сотрудник одобрил на секунду раньше — «Перевод уже нельзя отменить»', 't2', function () {
+    decision('Второе решение по уже одобренному переводу: applied: false, перевод не ждёт решения', 't2', 'DENY', 'd2b', function () {
+      status(200);
+      pm.test('Не применено', () => pm.expect(json()).to.eql({ applied: false, transferStatus: 'PROCESSING' }));
+    }),
+    cancel('US-04: сотрудник одобрил на секунду раньше — «Перевод уже нельзя отменить»', 't2', function () {
       problem(409, 'TRANSFER_NOT_CANCELLABLE');
       pm.test('Текущий статус в ответе', () => pm.expect(json().currentStatus).to.equal('PROCESSING'));
     }),
@@ -662,12 +670,16 @@ export const folders = [
     lookup('Поиск Сергея: получатель есть в базе ЦБ', { phone: PHONE.sergey, save: 'tokSergey' }),
     create('Перевод Сергею', { token: 'tokSergey', amount: '1000.00', save: 't2' }, function () { status(201); }),
     advance(1, 'Время +1 с'),
+    get('Приостановлен: момент приостановки', 't2', function () {
+      expectStatus('AWAITING_CONFIRMATION');
+      setv('suspendedAt', json().updatedAt);
+    }),
     confirm('Подтверждение', 't2', function () { expectStatus('PROCESSING'); }),
     advance(1, 'Время +1 с: сверка с базой ЦБ нашла сведения'),
     get('Отказ 27: «Будет выполнен не раньше» — через 2 дня от приостановки', 't2', function () {
       expectStatus('DELAYED');
       pm.test('Можно отменить', () => pm.expect(json().cancellable).to.equal(true));
-      pm.test('P-21: 2 дня от приостановки', () => pm.expect(json().executeAfter).to.match(/^2026-11-18T12:00:0\d\+03:00$/));
+      pm.test('P-21: 2 дня от приостановки', () => pm.expect(ms(json().executeAfter) - ms(v('suspendedAt'))).to.equal(48 * HOUR));
       setv('executeAfter', json().executeAfter);
     }),
     step('Пуш с датой исполнения', {
@@ -722,6 +734,9 @@ export const folders = [
     advance(1, 'Время +1 с'),
     decision('TR-35: сотрудник на проверке нашёл признаки и приостановил', 't7', 'SUSPEND', 'd7', function () {
       pm.test('Применено', () => pm.expect(json()).to.eql({ applied: true, transferStatus: 'AWAITING_CONFIRMATION' }));
+    }),
+    decision('Ещё одно решение по приостановленному переводу: applied: false', 't7', 'ALLOW', 'd7b', function () {
+      pm.test('Не применено, ждёт клиента', () => pm.expect(json()).to.eql({ applied: false, transferStatus: 'AWAITING_CONFIRMATION' }));
     }),
     lookup('Поиск Ивана', { phone: PHONE.ivan }),
     create('Обычный перевод Ивану', { save: 't8' }, function () { status(201); }),
